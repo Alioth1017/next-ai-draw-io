@@ -55,10 +55,17 @@ export function replaceHistoricalToolInputs(messages: any[]): any[] {
         if (msg.role !== "assistant" || !Array.isArray(msg.content)) {
             return msg
         }
+
+        let hasDiagramToolPlaceholder = false
         const replacedContent = msg.content
             .map((part: any) => {
+                const toolName = part.toolName
+                const isHistoricalDiagramTool =
+                    toolName === "display_diagram" ||
+                    toolName === "edit_diagram" ||
+                    toolName === "append_diagram"
+
                 if (part.type === "tool-call") {
-                    const toolName = part.toolName
                     // Fix invalid/undefined inputs from interrupted streaming
                     if (
                         !part.input ||
@@ -68,19 +75,22 @@ export function replaceHistoricalToolInputs(messages: any[]): any[] {
                         // Skip tool calls with invalid inputs entirely
                         return null
                     }
-                    if (
-                        toolName === "display_diagram" ||
-                        toolName === "edit_diagram"
-                    ) {
+                    if (isHistoricalDiagramTool) {
+                        if (hasDiagramToolPlaceholder) {
+                            return null
+                        }
+                        hasDiagramToolPlaceholder = true
                         return {
-                            ...part,
-                            input: {
-                                placeholder:
-                                    "[XML content replaced - see current diagram XML in system context]",
-                            },
+                            type: "text",
+                            text: "[Historical diagram tool call omitted - use current diagram XML in system context]",
                         }
                     }
                 }
+
+                if (part.type === "tool-result" && isHistoricalDiagramTool) {
+                    return null
+                }
+
                 return part
             })
             .filter(Boolean) // Remove null entries (invalid tool calls)

@@ -749,7 +749,7 @@ export function ChatMessageDisplay({
                                             </button>
                                         </div>
                                     )}
-                                <div className="max-w-[85%] min-w-0">
+                                <div className="w-full max-w-[85%] min-w-0">
                                     {/* Reasoning blocks - displayed first for assistant messages */}
                                     {message.role === "assistant" &&
                                         message.parts?.map(
@@ -993,7 +993,7 @@ export function ChatMessageDisplay({
                                                                         "system"
                                                                       ? "bg-destructive/10 text-destructive border border-destructive/20 rounded-2xl rounded-bl-md"
                                                                       : "bg-muted/60 text-foreground rounded-2xl rounded-bl-md"
-                                                            } ${message.role === "user" && isLastUserMessage && onEditMessage ? "cursor-pointer hover:opacity-90 transition-opacity" : ""} ${groupIndex > 0 ? "mt-3" : ""}`}
+                                                            } ${message.role === "assistant" || message.role === "user" ? "w-full" : ""} ${message.role === "user" && isLastUserMessage && onEditMessage ? "cursor-pointer hover:opacity-90 transition-opacity" : ""} ${groupIndex > 0 ? "mt-3" : ""}`}
                                                             role={
                                                                 message.role ===
                                                                     "user" &&
@@ -1082,7 +1082,7 @@ export function ChatMessageDisplay({
                                                                         return (
                                                                             <div
                                                                                 key={`${message.id}-text-${group.startIndex}-${partIndex}`}
-                                                                                className="space-y-2"
+                                                                                className="w-full min-w-0 space-y-2"
                                                                             >
                                                                                 {sections.map(
                                                                                     (
@@ -1185,15 +1185,20 @@ export function ChatMessageDisplay({
                                                                                             )
                                                                                         }
                                                                                         // Regular text section
-                                                                                        return (
+                                                                                        return message.role ===
+                                                                                            "user" ? (
                                                                                             <div
                                                                                                 key={`${message.id}-textsection-${partIndex}-${sectionIndex}`}
-                                                                                                className={`prose prose-sm max-w-none break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 ${
-                                                                                                    message.role ===
-                                                                                                    "user"
-                                                                                                        ? "[&_*]:!text-primary-foreground prose-code:bg-white/20"
-                                                                                                        : "dark:prose-invert"
-                                                                                                }`}
+                                                                                                className="w-full whitespace-pre-wrap break-normal text-primary-foreground"
+                                                                                            >
+                                                                                                {
+                                                                                                    section.content
+                                                                                                }
+                                                                                            </div>
+                                                                                        ) : (
+                                                                                            <div
+                                                                                                key={`${message.id}-textsection-${partIndex}-${sectionIndex}`}
+                                                                                                className="w-full min-w-0 text-foreground leading-7 break-normal wrap-anywhere [&_p]:my-0 [&_p+p]:mt-3 [&_ul]:my-3 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-3 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-1 [&_pre]:my-3 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-background/80 [&_pre]:p-3 [&_code]:wrap-break-word [&_blockquote]:my-3 [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-4 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0"
                                                                                             >
                                                                                                 <ReactMarkdown>
                                                                                                     {

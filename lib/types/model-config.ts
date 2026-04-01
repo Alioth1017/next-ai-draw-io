@@ -2,6 +2,7 @@
 
 export type ProviderName =
     | "openai"
+    | "githubcopilot"
     | "anthropic"
     | "google"
     | "vertexai"
@@ -38,6 +39,10 @@ export interface ProviderConfig {
     name?: string // Custom display name (e.g., "OpenAI Production")
     apiKey: string
     baseUrl?: string
+    // GitHub Copilot specific fields
+    copilotConnected?: boolean
+    copilotAccountLabel?: string
+    copilotEnterpriseUrl?: string
     // AWS Bedrock specific fields
     awsAccessKeyId?: string
     awsSecretAccessKey?: string
@@ -88,6 +93,7 @@ export interface FlattenedModel {
 // Map provider names to models.dev logo names
 export const PROVIDER_LOGO_MAP: Record<string, string> = {
     openai: "openai",
+    githubcopilot: "github",
     anthropic: "anthropic",
     google: "google",
     azure: "azure",
@@ -113,6 +119,10 @@ export const PROVIDER_INFO: Record<
     openai: {
         label: "OpenAI",
         defaultBaseUrl: "https://api.openai.com/v1",
+    },
+    githubcopilot: {
+        label: "GitHub Copilot",
+        defaultBaseUrl: "https://api.githubcopilot.com",
     },
     anthropic: {
         label: "Anthropic",
@@ -208,6 +218,17 @@ export const SUGGESTED_MODELS: Partial<Record<ProviderName, string[]>> = {
         "gpt-4.1-nano",
         "gpt-4o",
         "gpt-4o-mini",
+    ],
+    githubcopilot: [
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex",
+        "gpt-4o",
+        // Keep only the highest commonly exposed version for each Claude family
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview",
     ],
     anthropic: [
         // Claude 4.5 series (latest)

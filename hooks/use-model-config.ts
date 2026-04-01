@@ -238,14 +238,36 @@ export function useModelConfig(): UseModelConfigReturn {
 
     const addProvider = useCallback(
         (provider: ProviderName): ProviderConfig => {
+            const existingProvider =
+                provider === "githubcopilot"
+                    ? config.providers.find(
+                          (item) => item.provider === "githubcopilot",
+                      )
+                    : undefined
+
+            if (existingProvider) {
+                return existingProvider
+            }
+
             const newProvider = createProviderConfig(provider)
-            setConfig((prev) => ({
-                ...prev,
-                providers: [...prev.providers, newProvider],
-            }))
+            setConfig((prev) => {
+                if (
+                    provider === "githubcopilot" &&
+                    prev.providers.some(
+                        (item) => item.provider === "githubcopilot",
+                    )
+                ) {
+                    return prev
+                }
+
+                return {
+                    ...prev,
+                    providers: [...prev.providers, newProvider],
+                }
+            })
             return newProvider
         },
-        [],
+        [config.providers],
     )
 
     const updateProvider = useCallback(

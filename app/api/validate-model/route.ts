@@ -9,7 +9,16 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider"
 import { generateText } from "ai"
 import { NextResponse } from "next/server"
 import { createOllama } from "ollama-ai-provider-v2"
-import { normalizeMiniMaxBaseURL } from "@/lib/ai-providers"
+import {
+    normalizeMiniMaxBaseURL,
+    shouldUseGitHubCopilotResponsesApi,
+} from "@/lib/ai-providers"
+import {
+    createGitHubCopilotFetch,
+    getGitHubCopilotApiBaseUrl,
+    getGitHubCopilotAuthSession,
+} from "@/lib/github-copilot"
+import { probeGitHubCopilotChatCompletions } from "@/lib/github-copilot-probe"
 import { allowPrivateUrls, isPrivateUrl } from "@/lib/ssrf-protection"
 import { PROVIDER_INFO, type ProviderName } from "@/lib/types/model-config"
 
@@ -29,19 +38,25 @@ interface ValidateRequest {
 }
 
 export async function POST(req: Request) {
+    let provider = ""
+    let modelId = ""
+
     try {
         const body: ValidateRequest = await req.json()
         const {
-            provider,
+            provider: requestProvider,
             apiKey,
             baseUrl,
-            modelId,
+            modelId: requestModelId,
             awsAccessKeyId,
             awsSecretAccessKey,
             awsRegion,
             // Note: Express Mode only needs vertexApiKey
             vertexApiKey,
         } = body
+
+        provider = requestProvider
+        modelId = requestModelId
 
         if (!provider || !modelId) {
             return NextResponse.json(
@@ -79,7 +94,12 @@ export async function POST(req: Request) {
                     { status: 400 },
                 )
             }
-        } else if (provider !== "ollama" && provider !== "edgeone" && !apiKey) {
+        } else if (
+            provider !== "ollama" &&
+            provider !== "edgeone" &&
+            provider !== "githubcopilot" &&
+            !apiKey
+        ) {
             return NextResponse.json(
                 { valid: false, error: "API key is required" },
                 { status: 400 },
@@ -150,6 +170,34 @@ export async function POST(req: Request) {
                     ...(baseUrl && { baseURL: baseUrl }),
                 })
                 model = openrouter(modelId)
+                break
+            }
+
+            case "githubcopilot": {
+                const copilotAuth = getGitHubCopilotAuthSession(req)
+                if (!copilotAuth?.accessToken) {
+                    return NextResponse.json(
+                        {
+                            valid: false,
+                            error: "GitHub Copilot login required",
+                        },
+                        { status: 401 },
+                    )
+                }
+
+                const copilot = createOpenAI({
+                    apiKey: copilotAuth.accessToken,
+                    baseURL:
+                        baseUrl ||
+                        getGitHubCopilotApiBaseUrl(copilotAuth.enterpriseUrl),
+                    fetch: createGitHubCopilotFetch({
+                        token: copilotAuth.accessToken,
+                    }),
+                })
+
+                model = shouldUseGitHubCopilotResponsesApi(modelId)
+                    ? copilot.responses(modelId)
+                    : copilot.chat(modelId)
                 break
             }
 
@@ -396,6 +444,36 @@ export async function POST(req: Request) {
         })
     } catch (error) {
         console.error("[validate-model] Error:", error)
+
+        if (
+            provider === "githubcopilot" &&
+            error instanceof Error &&
+            error.message.includes("Invalid JSON response")
+        ) {
+            const copilotAuth = getGitHubCopilotAuthSession(req)
+            if (copilotAuth?.accessToken) {
+                try {
+                    const fallback = await probeGitHubCopilotChatCompletions({
+                        accessToken: copilotAuth.accessToken,
+                        modelId,
+                        enterpriseUrl: copilotAuth.enterpriseUrl,
+                    })
+
+                    if (fallback.ok) {
+                        return NextResponse.json({
+                            valid: true,
+                            responseTime: 0,
+                            note: "Validated via raw GitHub Copilot chat-completions fallback",
+                        })
+                    }
+                } catch (fallbackError) {
+                    console.error(
+                        "[validate-model] GitHub Copilot fallback failed:",
+                        fallbackError,
+                    )
+                }
+            }
+        }
 
         let errorMessage = "Validation failed"
         if (error instanceof Error) {

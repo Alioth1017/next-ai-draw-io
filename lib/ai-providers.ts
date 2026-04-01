@@ -9,7 +9,15 @@ import { createOpenAI, openai } from "@ai-sdk/openai"
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers"
 import { createOpenRouter } from "@openrouter/ai-sdk-provider"
 import { createOllama, ollama } from "ollama-ai-provider-v2"
+import {
+    buildGitHubCopilotHeaders,
+    createGitHubCopilotFetch,
+    getGitHubCopilotApiBaseUrl,
+} from "@/lib/github-copilot"
+import { supportsImageInput } from "@/lib/model-capabilities"
 import { PROVIDER_INFO, type ProviderName } from "@/lib/types/model-config"
+
+export { supportsImageInput } from "@/lib/model-capabilities"
 
 export type { ProviderName }
 
@@ -62,6 +70,7 @@ export interface ClientOverrides {
     baseUrl?: string | null
     apiKey?: string | null
     modelId?: string | null
+    preferResponses?: boolean
     // AWS Bedrock credentials
     awsAccessKeyId?: string | null
     awsSecretAccessKey?: string | null
@@ -80,6 +89,7 @@ export interface ClientOverrides {
 // Providers that can be selected from client settings
 const ALLOWED_CLIENT_PROVIDERS: ProviderName[] = [
     "openai",
+    "githubcopilot",
     "anthropic",
     "google",
     "vertexai",
@@ -138,6 +148,28 @@ export function resolveBaseURL(
     }
     // No user API key - fall back to server config
     return userBaseUrl || serverBaseUrl || defaultBaseUrl || undefined
+}
+
+export function shouldUseGitHubCopilotResponsesApi(
+    modelId: string | null | undefined,
+): boolean {
+    if (!modelId) return false
+
+    const match = /^gpt-(\d+)/i.exec(modelId)
+    if (!match) return false
+
+    return Number(match[1]) >= 5 && !modelId.startsWith("gpt-5-mini")
+}
+
+function normalizeGitHubCopilotModelId(modelId: string): string {
+    switch (modelId) {
+        case "gemini-3.1-pro":
+            return "gemini-3.1-pro-preview"
+        case "gemini-3-flash":
+            return "gemini-3-flash-preview"
+        default:
+            return modelId
+    }
 }
 
 /**
@@ -512,6 +544,7 @@ function buildProviderOptions(
         }
 
         case "deepseek":
+        case "githubcopilot":
         case "openrouter":
         case "siliconflow":
         case "sglang":
@@ -540,6 +573,7 @@ function buildProviderOptions(
 const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
     bedrock: null, // AWS SDK auto-uses IAM role on AWS, or env vars locally
     openai: "OPENAI_API_KEY",
+    githubcopilot: null,
     anthropic: "ANTHROPIC_API_KEY",
     google: "GOOGLE_GENERATIVE_AI_API_KEY",
     vertexai: "GOOGLE_VERTEX_API_KEY",
@@ -830,6 +864,42 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
             } else {
                 model = openai(modelId)
             }
+            break
+        }
+
+        case "githubcopilot": {
+            const apiKey = overrides?.apiKey
+            if (!apiKey) {
+                throw new Error(
+                    "GitHub Copilot login required. Connect GitHub Copilot in Model Configuration.",
+                )
+            }
+
+            const baseURL =
+                overrides?.baseUrl || getGitHubCopilotApiBaseUrl(undefined)
+            const copilotModelId = normalizeGitHubCopilotModelId(modelId)
+            const copilotHeaders = buildGitHubCopilotHeaders({
+                token: apiKey,
+                extraHeaders: overrides?.headers,
+            })
+
+            const copilotProvider = createOpenAI({
+                apiKey,
+                baseURL,
+                fetch: createGitHubCopilotFetch({
+                    token: apiKey,
+                    extraHeaders: overrides?.headers,
+                }),
+            })
+
+            const useResponses =
+                overrides?.preferResponses === true ||
+                shouldUseGitHubCopilotResponsesApi(copilotModelId)
+
+            model = useResponses
+                ? copilotProvider.responses(copilotModelId)
+                : copilotProvider.chat(copilotModelId)
+            headers = copilotHeaders
             break
         }
 
@@ -1290,7 +1360,7 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
 
         default:
             throw new Error(
-                `Unknown AI provider: ${provider}. Supported providers: bedrock, openai, anthropic, google, azure, ollama, openrouter, deepseek, siliconflow, sglang, gateway, edgeone, doubao, modelscope, glm, qwen, qiniu, kimi, minimax, novita`,
+                `Unknown AI provider: ${provider}. Supported providers: bedrock, openai, githubcopilot, anthropic, google, azure, ollama, openrouter, deepseek, siliconflow, sglang, gateway, edgeone, doubao, modelscope, glm, qwen, qiniu, kimi, minimax, novita`,
             )
     }
 
@@ -1314,68 +1384,6 @@ export function supportsPromptCaching(modelId: string): boolean {
         modelId.startsWith("us.anthropic") ||
         modelId.startsWith("eu.anthropic")
     )
-}
-
-/**
- * Check if a model supports image/vision input.
- * Some models silently drop image parts without error (AI SDK warning only).
- */
-export function supportsImageInput(modelId: string): boolean {
-    const lowerModelId = modelId.toLowerCase()
-
-    // Helper to check if model has vision capability indicator
-    const hasVisionIndicator =
-        lowerModelId.includes("vision") || lowerModelId.includes("vl")
-
-    // Models that DON'T support image/vision input (unless vision variant)
-    // Kimi K2 doesn't support images, but K2.5 does
-    // Only block kimi-k2 specifically, not other Kimi models
-    if (
-        (lowerModelId.includes("kimi-k2") ||
-            lowerModelId.includes("kimi_k2")) &&
-        !hasVisionIndicator &&
-        !lowerModelId.includes("2.5") &&
-        !lowerModelId.includes("k2.5")
-    ) {
-        return false
-    }
-
-    // Moonshot text models (moonshot-v1 series are text-only)
-    if (lowerModelId.includes("moonshot-v1") && !hasVisionIndicator) {
-        return false
-    }
-
-    // MiniMax text models (MiniMax-M2.x series are text-only)
-    if (lowerModelId.includes("minimax") && !hasVisionIndicator) {
-        return false
-    }
-
-    // DeepSeek text models (not vision variants)
-    if (lowerModelId.includes("deepseek") && !hasVisionIndicator) {
-        return false
-    }
-
-    // Qwen text models (not vision variants like qwen-vl)
-    // qwen3.5-plus is a vision model
-    if (
-        lowerModelId.includes("qwen") &&
-        !hasVisionIndicator &&
-        !lowerModelId.includes("qwen3.5-plus") &&
-        !lowerModelId.includes("qwen3.5-flash")
-    ) {
-        return false
-    }
-
-    // GLM text models (not vision variants)
-    // GLM vision models: glm-4v, glm-4v-9b, glm-4.1v-9b-thinking
-    if (lowerModelId.includes("glm") && !hasVisionIndicator) {
-        if (!/[\d.]v/.test(lowerModelId)) {
-            return false
-        }
-    }
-
-    // Default: assume model supports images
-    return true
 }
 
 /**

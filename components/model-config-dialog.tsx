@@ -12,6 +12,7 @@ import {
     Link2,
     Loader2,
     Plus,
+    RefreshCw,
     Server,
     Settings2,
     Sparkles,
@@ -52,6 +53,10 @@ import {
 import { Switch } from "@/components/ui/switch"
 import { useDictionary } from "@/hooks/use-dictionary"
 import type { UseModelConfigReturn } from "@/hooks/use-model-config"
+import type {
+    GitHubCopilotDiscoveredModel,
+    GitHubCopilotDiscoveryErrorType,
+} from "@/lib/github-copilot-models"
 import { formatMessage } from "@/lib/i18n/utils"
 import type { ProviderConfig, ProviderName } from "@/lib/types/model-config"
 import {
@@ -68,6 +73,80 @@ interface ModelConfigDialogProps {
 }
 
 type ValidationStatus = "idle" | "validating" | "success" | "error"
+
+interface CopilotStatusState {
+    connected: boolean
+    pending: boolean
+    accountLabel?: string
+    login?: string
+    userCode?: string
+    verificationUri?: string
+    interval?: number
+}
+
+interface CopilotRejectedModelInfo {
+    error: string
+    errorType?: GitHubCopilotDiscoveryErrorType
+    statusCode?: number
+    responseSnippet?: string
+}
+
+function isDefinitiveCopilotModelRejection(message: string | undefined) {
+    if (!message) {
+        return false
+    }
+
+    const normalized = message.toLowerCase()
+    return normalized.includes("requested model is not supported")
+}
+
+function formatCopilotDiscoveryReason(
+    dict: ReturnType<typeof useDictionary>,
+    info: CopilotRejectedModelInfo | undefined,
+) {
+    if (!info) {
+        return ""
+    }
+
+    const labelByType: Partial<
+        Record<GitHubCopilotDiscoveryErrorType, string>
+    > = {
+        unsupported: dict.modelConfig.copilotReasonUnsupported,
+        "invalid-json": dict.modelConfig.copilotReasonInvalidJson,
+        "rate-limit": dict.modelConfig.copilotReasonRateLimit,
+        auth: dict.modelConfig.copilotReasonAuth,
+        "server-error": dict.modelConfig.copilotReasonServerError,
+        unknown: dict.modelConfig.copilotReasonUnknown,
+    }
+
+    const baseLabel =
+        (info.errorType && labelByType[info.errorType]) ||
+        dict.modelConfig.copilotReasonUnknown
+    const parts = [baseLabel]
+
+    if (info.statusCode) {
+        parts.push(`HTTP ${info.statusCode}`)
+    }
+    if (info.responseSnippet) {
+        parts.push(info.responseSnippet)
+    } else if (info.error) {
+        parts.push(info.error)
+    }
+
+    return parts.join(" · ")
+}
+
+function isCopilotProtocolMismatch(info: CopilotRejectedModelInfo | undefined) {
+    return info?.errorType === "invalid-json"
+}
+
+function isTransientCopilotFailure(info: CopilotRejectedModelInfo | undefined) {
+    return (
+        !!info &&
+        !isCopilotProtocolMismatch(info) &&
+        !isDefinitiveCopilotModelRejection(info.error)
+    )
+}
 
 // Provider logo component
 function ProviderLogo({
@@ -166,6 +245,18 @@ export function ModelConfigDialog({
         modelId: string
         message: string
     } | null>(null)
+    const [copilotStatus, setCopilotStatus] = useState<CopilotStatusState>({
+        connected: false,
+        pending: false,
+    })
+    const [copilotBusy, setCopilotBusy] = useState(false)
+    const [copilotDiscoveryBusy, setCopilotDiscoveryBusy] = useState(false)
+    const [copilotDiscoverySummary, setCopilotDiscoverySummary] = useState("")
+    const [copilotDiscoveredModelIds, setCopilotDiscoveredModelIds] = useState<
+        string[]
+    >([])
+    const [copilotRejectedModelErrors, setCopilotRejectedModelErrors] =
+        useState<Record<string, CopilotRejectedModelInfo>>({})
 
     const {
         config,
@@ -180,6 +271,41 @@ export function ModelConfigDialog({
     // Get selected provider
     const selectedProvider = config.providers.find(
         (p) => p.id === selectedProviderId,
+    )
+    const selectedProviderRef = useRef(selectedProvider)
+
+    useEffect(() => {
+        selectedProviderRef.current = selectedProvider
+    }, [selectedProvider])
+
+    const syncCopilotProviderState = useCallback(
+        (state: { connected: boolean; accountLabel?: string }) => {
+            const provider = selectedProviderRef.current
+
+            if (
+                !selectedProviderId ||
+                !provider ||
+                provider.provider !== "githubcopilot"
+            ) {
+                return
+            }
+
+            const nextAccountLabel = state.connected
+                ? state.accountLabel
+                : undefined
+            if (
+                provider.validated !== state.connected ||
+                provider.copilotConnected !== state.connected ||
+                provider.copilotAccountLabel !== nextAccountLabel
+            ) {
+                updateProvider(selectedProviderId, {
+                    validated: state.connected,
+                    copilotConnected: state.connected,
+                    copilotAccountLabel: nextAccountLabel,
+                })
+            }
+        },
+        [selectedProviderId, updateProvider],
     )
 
     // Cleanup validation reset timeout on unmount
@@ -202,9 +328,89 @@ export function ModelConfigDialog({
     const availableSuggestions = suggestedModels.filter(
         (modelId) => !existingModelIds.includes(modelId),
     )
+    const inferredCopilotDiscoveredModelIds =
+        selectedProvider?.provider === "githubcopilot"
+            ? Array.from(
+                  new Set([
+                      ...copilotDiscoveredModelIds,
+                      ...selectedProvider.models
+                          .filter((model) => model.validated)
+                          .map((model) => model.modelId),
+                  ]),
+              )
+            : []
+    const availableDiscoveredSuggestions =
+        selectedProvider?.provider === "githubcopilot"
+            ? inferredCopilotDiscoveredModelIds.filter(
+                  (modelId) => !existingModelIds.includes(modelId),
+              )
+            : []
+    const availableStaticCandidateSuggestions =
+        selectedProvider?.provider === "githubcopilot"
+            ? suggestedModels.filter(
+                  (modelId) =>
+                      !existingModelIds.includes(modelId) &&
+                      !availableDiscoveredSuggestions.includes(modelId) &&
+                      !isCopilotProtocolMismatch(
+                          copilotRejectedModelErrors[modelId],
+                      ) &&
+                      !isDefinitiveCopilotModelRejection(
+                          copilotRejectedModelErrors[modelId]?.error,
+                      ),
+              )
+            : availableSuggestions
+    const unavailableCopilotSuggestions =
+        selectedProvider?.provider === "githubcopilot"
+            ? suggestedModels.filter(
+                  (modelId) =>
+                      !existingModelIds.includes(modelId) &&
+                      !availableDiscoveredSuggestions.includes(modelId) &&
+                      !!copilotRejectedModelErrors[modelId],
+              )
+            : []
+    const protocolMismatchCopilotSuggestions =
+        selectedProvider?.provider === "githubcopilot"
+            ? Object.keys(copilotRejectedModelErrors)
+                  .filter(
+                      (modelId) =>
+                          !existingModelIds.includes(modelId) &&
+                          !availableDiscoveredSuggestions.includes(modelId) &&
+                          isCopilotProtocolMismatch(
+                              copilotRejectedModelErrors[modelId],
+                          ),
+                  )
+                  .sort()
+            : []
+    const definitiveUnavailableCopilotSuggestions =
+        selectedProvider?.provider === "githubcopilot"
+            ? unavailableCopilotSuggestions.filter((modelId) =>
+                  isDefinitiveCopilotModelRejection(
+                      copilotRejectedModelErrors[modelId]?.error,
+                  ),
+              )
+            : []
+    const selectableSuggestionCount =
+        selectedProvider?.provider === "githubcopilot"
+            ? availableDiscoveredSuggestions.length +
+              availableStaticCandidateSuggestions.length
+            : availableSuggestions.length
+    const hasGitHubCopilotProvider = config.providers.some(
+        (provider) => provider.provider === "githubcopilot",
+    )
 
     // Handle adding a new provider
     const handleAddProvider = (providerType: ProviderName) => {
+        if (providerType === "githubcopilot") {
+            const existingProvider = config.providers.find(
+                (provider) => provider.provider === "githubcopilot",
+            )
+            if (existingProvider) {
+                setSelectedProviderId(existingProvider.id)
+                setValidationStatus("idle")
+                return
+            }
+        }
+
         const newProvider = addProvider(providerType)
         setSelectedProviderId(newProvider.id)
         setValidationStatus("idle")
@@ -255,11 +461,332 @@ export function ModelConfigDialog({
     // Handle deleting the provider
     const handleDeleteProvider = () => {
         if (!selectedProviderId) return
+        if (selectedProvider?.provider === "githubcopilot") {
+            void fetch("/api/github-copilot/logout", { method: "POST" })
+        }
         deleteProvider(selectedProviderId)
         setSelectedProviderId(null)
         setValidationStatus("idle")
         setDeleteConfirmOpen(false)
     }
+
+    const loadCopilotStatus = useCallback(async () => {
+        const provider = selectedProviderRef.current
+        if (!provider || provider.provider !== "githubcopilot") {
+            return
+        }
+
+        try {
+            const response = await fetch("/api/github-copilot/status", {
+                cache: "no-store",
+            })
+            const data = await response.json()
+
+            const nextState: CopilotStatusState = {
+                connected: !!data.connected,
+                pending: !!data.pending,
+                accountLabel: data.accountLabel,
+                login: data.login,
+                userCode: data.userCode,
+                verificationUri: data.verificationUri,
+                interval: data.interval,
+            }
+
+            setCopilotStatus(nextState)
+            if (nextState.connected) {
+                syncCopilotProviderState({
+                    connected: true,
+                    accountLabel: nextState.accountLabel,
+                })
+            } else if (!nextState.pending) {
+                syncCopilotProviderState({
+                    connected: false,
+                })
+            }
+        } catch {
+            setValidationError("Failed to load GitHub Copilot status")
+        }
+    }, [syncCopilotProviderState])
+
+    const handleStartCopilotLogin = useCallback(async () => {
+        const provider = selectedProviderRef.current
+        if (!provider || provider.provider !== "githubcopilot") {
+            return
+        }
+
+        setCopilotBusy(true)
+        setValidationError("")
+
+        try {
+            const response = await fetch("/api/github-copilot/start", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({}),
+            })
+            const data = await response.json()
+
+            if (!response.ok) {
+                throw new Error(
+                    data.error || "Failed to start GitHub Copilot login",
+                )
+            }
+
+            setCopilotStatus({
+                connected: false,
+                pending: true,
+                userCode: data.userCode,
+                verificationUri: data.verificationUri,
+                interval: data.interval,
+            })
+            syncCopilotProviderState({ connected: false })
+        } catch (error) {
+            setValidationError(
+                error instanceof Error
+                    ? error.message
+                    : "Failed to start GitHub Copilot login",
+            )
+        } finally {
+            setCopilotBusy(false)
+        }
+    }, [syncCopilotProviderState])
+
+    const handlePollCopilotLogin = useCallback(async () => {
+        const provider = selectedProviderRef.current
+        if (!provider || provider.provider !== "githubcopilot") {
+            return
+        }
+
+        setCopilotBusy(true)
+
+        try {
+            const response = await fetch("/api/github-copilot/poll", {
+                method: "POST",
+            })
+            const data = await response.json()
+
+            if (response.status === 202) {
+                setCopilotStatus({
+                    connected: false,
+                    pending: true,
+                    userCode: data.userCode,
+                    verificationUri: data.verificationUri,
+                    interval: data.interval,
+                })
+                return
+            }
+
+            if (!response.ok) {
+                throw new Error(
+                    data.error || "GitHub Copilot authorization failed",
+                )
+            }
+
+            setValidationError("")
+            setCopilotStatus({
+                connected: true,
+                pending: false,
+                accountLabel: data.accountLabel,
+                login: data.login,
+            })
+            syncCopilotProviderState({
+                connected: true,
+                accountLabel: data.accountLabel,
+            })
+        } catch (error) {
+            setCopilotStatus({ connected: false, pending: false })
+            setValidationError(
+                error instanceof Error
+                    ? error.message
+                    : "GitHub Copilot authorization failed",
+            )
+            syncCopilotProviderState({ connected: false })
+        } finally {
+            setCopilotBusy(false)
+        }
+    }, [syncCopilotProviderState])
+
+    const handleLogoutCopilot = useCallback(async () => {
+        const provider = selectedProviderRef.current
+        if (!provider || provider.provider !== "githubcopilot") {
+            return
+        }
+
+        setCopilotBusy(true)
+        try {
+            await fetch("/api/github-copilot/logout", { method: "POST" })
+            setCopilotStatus({ connected: false, pending: false })
+            setCopilotDiscoveredModelIds([])
+            setCopilotRejectedModelErrors({})
+            setCopilotDiscoverySummary("")
+            syncCopilotProviderState({ connected: false })
+        } finally {
+            setCopilotBusy(false)
+        }
+    }, [syncCopilotProviderState])
+
+    const handleDiscoverCopilotModels = useCallback(async () => {
+        const provider = selectedProviderRef.current
+        if (
+            !selectedProviderId ||
+            !provider ||
+            provider.provider !== "githubcopilot"
+        ) {
+            return
+        }
+
+        setCopilotDiscoveryBusy(true)
+        setValidationError("")
+        setCopilotDiscoverySummary("")
+
+        try {
+            const response = await fetch("/api/github-copilot/models", {
+                cache: "no-store",
+            })
+            const data = await response.json()
+
+            if (!response.ok) {
+                throw new Error(
+                    data.error || "Failed to discover GitHub Copilot models",
+                )
+            }
+
+            const discoveredModelIds: string[] = Array.isArray(data.models)
+                ? data.models
+                : []
+            const rejectedModelIds = new Map<string, CopilotRejectedModelInfo>(
+                Array.isArray(data.rejected)
+                    ? (data.rejected as GitHubCopilotDiscoveredModel[]).map(
+                          (item) => [
+                              item.modelId,
+                              {
+                                  error:
+                                      item.error ||
+                                      "Not available for current GitHub Copilot account",
+                                  errorType: item.errorType,
+                                  statusCode: item.statusCode,
+                                  responseSnippet: item.responseSnippet,
+                              },
+                          ],
+                      )
+                    : [],
+            )
+
+            setCopilotDiscoveredModelIds(discoveredModelIds)
+            setCopilotRejectedModelErrors(
+                Object.fromEntries(rejectedModelIds.entries()),
+            )
+
+            const existingModels = provider.models
+            const existingByModelId = new Map(
+                existingModels.map((model) => [model.modelId, model]),
+            )
+
+            for (const modelId of discoveredModelIds) {
+                const existing = existingByModelId.get(modelId)
+                if (existing) {
+                    updateModel(selectedProviderId, existing.id, {
+                        validated: true,
+                        validationError: undefined,
+                    })
+                    continue
+                }
+
+                const added = addModel(selectedProviderId, modelId)
+                updateModel(selectedProviderId, added.id, {
+                    validated: true,
+                    validationError: undefined,
+                })
+            }
+
+            for (const model of existingModels) {
+                if (discoveredModelIds.includes(model.modelId)) {
+                    continue
+                }
+
+                const rejectionInfo = rejectedModelIds.get(model.modelId)
+                if (!rejectionInfo) {
+                    continue
+                }
+
+                if (isTransientCopilotFailure(rejectionInfo)) {
+                    continue
+                }
+
+                updateModel(selectedProviderId, model.id, {
+                    validated: false,
+                    validationError: formatCopilotDiscoveryReason(
+                        dict,
+                        rejectionInfo,
+                    ),
+                })
+            }
+
+            const definitiveUnavailableCount = Array.from(
+                rejectedModelIds.values(),
+            ).filter((item) =>
+                isDefinitiveCopilotModelRejection(item.error),
+            ).length
+            const protocolMismatchCount = Array.from(
+                rejectedModelIds.values(),
+            ).filter((item) => item.errorType === "invalid-json").length
+            const transientFailureCount = Array.from(
+                rejectedModelIds.values(),
+            ).filter(
+                (item) =>
+                    item.errorType !== "invalid-json" &&
+                    !isDefinitiveCopilotModelRejection(item.error),
+            ).length
+
+            setCopilotDiscoverySummary(
+                `${discoveredModelIds.length} models available after checking ${data.checked || discoveredModelIds.length} candidates. ${protocolMismatchCount} protocol mismatches, ${definitiveUnavailableCount} unsupported, ${transientFailureCount} transient/other failures.`,
+            )
+        } catch (error) {
+            setValidationError(
+                error instanceof Error
+                    ? error.message
+                    : "Failed to discover GitHub Copilot models",
+            )
+        } finally {
+            setCopilotDiscoveryBusy(false)
+        }
+    }, [addModel, selectedProviderId, updateModel])
+
+    const isGitHubCopilotProvider =
+        selectedProvider?.provider === "githubcopilot"
+
+    useEffect(() => {
+        if (!open || !selectedProviderId) return
+        if (!isGitHubCopilotProvider) {
+            setCopilotStatus({ connected: false, pending: false })
+            return
+        }
+
+        void loadCopilotStatus()
+    }, [open, selectedProviderId, isGitHubCopilotProvider, loadCopilotStatus])
+
+    useEffect(() => {
+        if (!open || !selectedProviderId || !isGitHubCopilotProvider) {
+            return
+        }
+        if (!copilotStatus.pending || copilotBusy) return
+
+        const timeout = setTimeout(
+            () => {
+                void handlePollCopilotLogin()
+            },
+            Math.max(copilotStatus.interval || 5, 1) * 1000,
+        )
+
+        return () => clearTimeout(timeout)
+    }, [
+        open,
+        selectedProviderId,
+        isGitHubCopilotProvider,
+        copilotStatus.pending,
+        copilotStatus.interval,
+        copilotBusy,
+        handlePollCopilotLogin,
+    ])
 
     // Validate all models
     const handleValidate = useCallback(async () => {
@@ -373,6 +900,9 @@ export function ModelConfigDialog({
 
     // Get all available provider types
     const availableProviders = Object.keys(PROVIDER_INFO) as ProviderName[]
+    const addableProviders = availableProviders.filter(
+        (provider) => provider !== "githubcopilot" || !hasGitHubCopilotProvider,
+    )
 
     // Get display name for provider
     const getProviderDisplayName = (provider: ProviderConfig) => {
@@ -381,7 +911,7 @@ export function ModelConfigDialog({
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="sm:max-w-4xl h-[80vh] max-h-[800px] overflow-hidden flex flex-col gap-0 p-0">
+            <DialogContent className="sm:max-w-4xl h-[80vh] max-h-200 overflow-hidden flex flex-col gap-0 p-0">
                 {/* Header */}
                 <DialogHeader className="px-6 pt-6 pb-4 shrink-0">
                     <DialogTitle className="flex items-center gap-3">
@@ -449,7 +979,7 @@ export function ModelConfigDialog({
                                             >
                                                 <ProviderLogo
                                                     provider={provider.provider}
-                                                    className="flex-shrink-0"
+                                                    className="shrink-0"
                                                 />
                                             </div>
                                             <span className="flex-1 truncate font-medium">
@@ -458,7 +988,7 @@ export function ModelConfigDialog({
                                                 )}
                                             </span>
                                             {provider.validated ? (
-                                                <div className="flex-shrink-0 flex items-center justify-center w-5 h-5 rounded-full bg-success-muted">
+                                                <div className="shrink-0 flex items-center justify-center w-5 h-5 rounded-full bg-success-muted">
                                                     <Check className="h-3 w-3 text-success" />
                                                 </div>
                                             ) : (
@@ -493,7 +1023,7 @@ export function ModelConfigDialog({
                                     />
                                 </SelectTrigger>
                                 <SelectContent>
-                                    {availableProviders.map((p) => (
+                                    {addableProviders.map((p) => (
                                         <SelectItem
                                             key={p}
                                             value={p}
@@ -1017,6 +1547,193 @@ export function ModelConfigDialog({
                                                     </div>
                                                 </>
                                             ) : selectedProvider.provider ===
+                                              "githubcopilot" ? (
+                                                <div className="space-y-4">
+                                                    <div className="rounded-xl border border-border-subtle bg-surface-2/40 p-4 space-y-3">
+                                                        <p className="text-sm text-foreground">
+                                                            {
+                                                                dict.modelConfig
+                                                                    .copilotInstructions
+                                                            }
+                                                        </p>
+                                                        <p className="text-xs text-muted-foreground">
+                                                            {
+                                                                dict.modelConfig
+                                                                    .copilotTokenStoredServer
+                                                            }
+                                                        </p>
+                                                    </div>
+
+                                                    {copilotStatus.connected ? (
+                                                        <div className="rounded-xl border border-success/30 bg-success-muted p-4 space-y-3">
+                                                            <div className="flex items-center justify-between gap-4">
+                                                                <div className="min-w-0">
+                                                                    <p className="text-sm font-medium text-success">
+                                                                        {
+                                                                            dict
+                                                                                .modelConfig
+                                                                                .copilotConnected
+                                                                        }
+                                                                    </p>
+                                                                    <p className="text-xs text-muted-foreground truncate">
+                                                                        {copilotStatus.accountLabel ||
+                                                                            copilotStatus.login ||
+                                                                            "GitHub Copilot"}
+                                                                    </p>
+                                                                </div>
+                                                                <Button
+                                                                    variant="outline"
+                                                                    size="sm"
+                                                                    onClick={
+                                                                        handleLogoutCopilot
+                                                                    }
+                                                                    disabled={
+                                                                        copilotBusy ||
+                                                                        copilotDiscoveryBusy
+                                                                    }
+                                                                >
+                                                                    {
+                                                                        dict
+                                                                            .modelConfig
+                                                                            .copilotDisconnect
+                                                                    }
+                                                                </Button>
+                                                            </div>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                <Button
+                                                                    variant="outline"
+                                                                    size="sm"
+                                                                    onClick={
+                                                                        handleDiscoverCopilotModels
+                                                                    }
+                                                                    disabled={
+                                                                        copilotBusy ||
+                                                                        copilotDiscoveryBusy
+                                                                    }
+                                                                >
+                                                                    {copilotDiscoveryBusy ? (
+                                                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                                                    ) : (
+                                                                        <RefreshCw className="h-4 w-4 mr-1.5" />
+                                                                    )}
+                                                                    {
+                                                                        dict
+                                                                            .modelConfig
+                                                                            .copilotDiscoverModels
+                                                                    }
+                                                                </Button>
+                                                            </div>
+                                                            <p className="text-xs text-muted-foreground">
+                                                                {
+                                                                    dict
+                                                                        .modelConfig
+                                                                        .copilotDiscoverModelsHint
+                                                                }
+                                                            </p>
+                                                            {copilotDiscoverySummary ? (
+                                                                <p className="text-xs text-muted-foreground">
+                                                                    {
+                                                                        copilotDiscoverySummary
+                                                                    }
+                                                                </p>
+                                                            ) : null}
+                                                        </div>
+                                                    ) : null}
+
+                                                    {copilotStatus.pending ? (
+                                                        <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 space-y-3">
+                                                            <div>
+                                                                <p className="text-sm font-medium">
+                                                                    {
+                                                                        dict
+                                                                            .modelConfig
+                                                                            .copilotWaitingAuth
+                                                                    }
+                                                                </p>
+                                                                <p className="text-xs text-muted-foreground mt-1">
+                                                                    {
+                                                                        dict
+                                                                            .modelConfig
+                                                                            .copilotVerificationCode
+                                                                    }
+                                                                </p>
+                                                                <p className="mt-2 font-mono text-lg tracking-[0.2em]">
+                                                                    {
+                                                                        copilotStatus.userCode
+                                                                    }
+                                                                </p>
+                                                            </div>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                <Button
+                                                                    size="sm"
+                                                                    onClick={() => {
+                                                                        if (
+                                                                            copilotStatus.verificationUri
+                                                                        ) {
+                                                                            window.open(
+                                                                                copilotStatus.verificationUri,
+                                                                                "_blank",
+                                                                                "noopener,noreferrer",
+                                                                            )
+                                                                        }
+                                                                    }}
+                                                                >
+                                                                    {
+                                                                        dict
+                                                                            .modelConfig
+                                                                            .copilotOpenVerification
+                                                                    }
+                                                                </Button>
+                                                                <Button
+                                                                    variant="outline"
+                                                                    size="sm"
+                                                                    onClick={
+                                                                        handlePollCopilotLogin
+                                                                    }
+                                                                    disabled={
+                                                                        copilotBusy
+                                                                    }
+                                                                >
+                                                                    {copilotBusy ? (
+                                                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                                                    ) : (
+                                                                        dict
+                                                                            .modelConfig
+                                                                            .copilotCheckStatus
+                                                                    )}
+                                                                </Button>
+                                                            </div>
+                                                        </div>
+                                                    ) : null}
+
+                                                    {!copilotStatus.connected &&
+                                                    !copilotStatus.pending ? (
+                                                        <Button
+                                                            onClick={
+                                                                handleStartCopilotLogin
+                                                            }
+                                                            disabled={
+                                                                copilotBusy
+                                                            }
+                                                            className="h-9 px-4"
+                                                        >
+                                                            {copilotBusy ? (
+                                                                <Loader2 className="h-4 w-4 animate-spin" />
+                                                            ) : (
+                                                                dict.modelConfig
+                                                                    .copilotConnect
+                                                            )}
+                                                        </Button>
+                                                    ) : null}
+
+                                                    {validationError && (
+                                                        <p className="text-xs text-destructive flex items-center gap-1">
+                                                            <X className="h-3 w-3" />
+                                                            {validationError}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            ) : selectedProvider.provider ===
                                               "edgeone" ? (
                                                 <div className="space-y-3">
                                                     <div className="flex items-center gap-2">
@@ -1345,37 +2062,193 @@ export function ModelConfigDialog({
                                                         }
                                                     }}
                                                     disabled={
-                                                        availableSuggestions.length ===
+                                                        selectableSuggestionCount ===
                                                         0
                                                     }
                                                 >
                                                     <SelectTrigger className="w-28 h-8 rounded-lg hover:bg-interactive-hover">
                                                         <span className="text-xs">
-                                                            {availableSuggestions.length ===
+                                                            {selectableSuggestionCount ===
                                                             0
                                                                 ? dict
                                                                       .modelConfig
                                                                       .allAdded
-                                                                : dict
-                                                                      .modelConfig
-                                                                      .suggested}
+                                                                : selectedProvider.provider ===
+                                                                    "githubcopilot"
+                                                                  ? availableDiscoveredSuggestions.length >
+                                                                    0
+                                                                      ? dict
+                                                                            .modelConfig
+                                                                            .copilotDiscovered
+                                                                      : dict
+                                                                            .modelConfig
+                                                                            .copilotCandidateModels
+                                                                  : dict
+                                                                        .modelConfig
+                                                                        .suggested}
                                                         </span>
                                                     </SelectTrigger>
                                                     <SelectContent className="max-h-72">
-                                                        {availableSuggestions.map(
-                                                            (modelId) => (
-                                                                <SelectItem
-                                                                    key={
-                                                                        modelId
-                                                                    }
-                                                                    value={
-                                                                        modelId
-                                                                    }
-                                                                    className="font-mono text-xs"
-                                                                >
-                                                                    {modelId}
-                                                                </SelectItem>
-                                                            ),
+                                                        {selectedProvider.provider ===
+                                                        "githubcopilot" ? (
+                                                            <>
+                                                                {availableDiscoveredSuggestions.length >
+                                                                    0 && (
+                                                                    <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                                                                        {
+                                                                            dict
+                                                                                .modelConfig
+                                                                                .copilotDiscovered
+                                                                        }
+                                                                    </div>
+                                                                )}
+                                                                {availableDiscoveredSuggestions.map(
+                                                                    (
+                                                                        modelId,
+                                                                    ) => (
+                                                                        <SelectItem
+                                                                            key={
+                                                                                modelId
+                                                                            }
+                                                                            value={
+                                                                                modelId
+                                                                            }
+                                                                            className="font-mono text-xs"
+                                                                        >
+                                                                            {
+                                                                                modelId
+                                                                            }
+                                                                        </SelectItem>
+                                                                    ),
+                                                                )}
+                                                                {availableStaticCandidateSuggestions.length >
+                                                                    0 && (
+                                                                    <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                                                                        {
+                                                                            dict
+                                                                                .modelConfig
+                                                                                .copilotCandidateModels
+                                                                        }
+                                                                    </div>
+                                                                )}
+                                                                {availableStaticCandidateSuggestions.map(
+                                                                    (
+                                                                        modelId,
+                                                                    ) => (
+                                                                        <SelectItem
+                                                                            key={
+                                                                                modelId
+                                                                            }
+                                                                            value={
+                                                                                modelId
+                                                                            }
+                                                                            className="font-mono text-xs"
+                                                                        >
+                                                                            {
+                                                                                modelId
+                                                                            }
+                                                                        </SelectItem>
+                                                                    ),
+                                                                )}
+                                                                {protocolMismatchCopilotSuggestions.length >
+                                                                    0 && (
+                                                                    <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                                                                        {
+                                                                            dict
+                                                                                .modelConfig
+                                                                                .copilotProtocolMismatchModels
+                                                                        }
+                                                                    </div>
+                                                                )}
+                                                                {protocolMismatchCopilotSuggestions.map(
+                                                                    (
+                                                                        modelId,
+                                                                    ) => (
+                                                                        <div
+                                                                            key={`mismatch:${modelId}`}
+                                                                            className="px-2 py-2 text-xs opacity-80"
+                                                                            title={formatCopilotDiscoveryReason(
+                                                                                dict,
+                                                                                copilotRejectedModelErrors[
+                                                                                    modelId
+                                                                                ],
+                                                                            )}
+                                                                        >
+                                                                            <div className="font-mono text-xs text-foreground/80">
+                                                                                {
+                                                                                    modelId
+                                                                                }
+                                                                            </div>
+                                                                            <div className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">
+                                                                                {formatCopilotDiscoveryReason(
+                                                                                    dict,
+                                                                                    copilotRejectedModelErrors[
+                                                                                        modelId
+                                                                                    ],
+                                                                                )}
+                                                                            </div>
+                                                                        </div>
+                                                                    ),
+                                                                )}
+                                                                {definitiveUnavailableCopilotSuggestions.length >
+                                                                    0 && (
+                                                                    <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                                                                        {
+                                                                            dict
+                                                                                .modelConfig
+                                                                                .copilotUnavailableModels
+                                                                        }
+                                                                    </div>
+                                                                )}
+                                                                {definitiveUnavailableCopilotSuggestions.map(
+                                                                    (
+                                                                        modelId,
+                                                                    ) => (
+                                                                        <div
+                                                                            key={`unavailable:${modelId}`}
+                                                                            className="px-2 py-2 text-xs opacity-70"
+                                                                            title={formatCopilotDiscoveryReason(
+                                                                                dict,
+                                                                                copilotRejectedModelErrors[
+                                                                                    modelId
+                                                                                ],
+                                                                            )}
+                                                                        >
+                                                                            <div className="font-mono text-xs text-foreground/80">
+                                                                                {
+                                                                                    modelId
+                                                                                }
+                                                                            </div>
+                                                                            <div className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">
+                                                                                {formatCopilotDiscoveryReason(
+                                                                                    dict,
+                                                                                    copilotRejectedModelErrors[
+                                                                                        modelId
+                                                                                    ],
+                                                                                )}
+                                                                            </div>
+                                                                        </div>
+                                                                    ),
+                                                                )}
+                                                            </>
+                                                        ) : (
+                                                            availableSuggestions.map(
+                                                                (modelId) => (
+                                                                    <SelectItem
+                                                                        key={
+                                                                            modelId
+                                                                        }
+                                                                        value={
+                                                                            modelId
+                                                                        }
+                                                                        className="font-mono text-xs"
+                                                                    >
+                                                                        {
+                                                                            modelId
+                                                                        }
+                                                                    </SelectItem>
+                                                                ),
+                                                            )
                                                         )}
                                                     </SelectContent>
                                                 </Select>
@@ -1383,7 +2256,7 @@ export function ModelConfigDialog({
                                         }
                                     >
                                         {/* Model List */}
-                                        <div className="rounded-2xl border border-border-subtle bg-surface-2/30 overflow-hidden min-h-[120px]">
+                                        <div className="rounded-2xl border border-border-subtle bg-surface-2/30 overflow-hidden min-h-30">
                                             {selectedProvider.models.length ===
                                             0 ? (
                                                 <div className="p-6 text-center h-full flex flex-col items-center justify-center">
@@ -1409,7 +2282,7 @@ export function ModelConfigDialog({
                                                             >
                                                                 <div className="flex items-center gap-3 p-3 min-w-0">
                                                                     {/* Status icon */}
-                                                                    <div className="flex items-center justify-center w-8 h-8 rounded-lg flex-shrink-0">
+                                                                    <div className="flex items-center justify-center w-8 h-8 rounded-lg shrink-0">
                                                                         {validatingModelIndex !==
                                                                             null &&
                                                                         index ===
@@ -1676,7 +2549,9 @@ export function ModelConfigDialog({
                         </div>
                         <p className="text-xs text-muted-foreground flex items-center gap-1.5">
                             <Key className="h-3 w-3" />
-                            {dict.modelConfig.apiKeyStored}
+                            {selectedProvider?.provider === "githubcopilot"
+                                ? dict.modelConfig.copilotTokenStoredServer
+                                : dict.modelConfig.apiKeyStored}
                         </p>
                     </div>
                 </div>

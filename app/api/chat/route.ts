@@ -7,6 +7,7 @@ import {
     LoadAPIKeyError,
     stepCountIs,
     streamText,
+    wrapLanguageModel,
 } from "ai"
 import fs from "fs/promises"
 import { jsonrepair } from "jsonrepair"
@@ -15,6 +16,7 @@ import { z } from "zod"
 import {
     getAIModel,
     SINGLE_SYSTEM_PROVIDERS,
+    shouldUseGitHubCopilotResponsesApi,
     supportsImageInput,
     supportsPromptCaching,
 } from "@/lib/ai-providers"
@@ -30,6 +32,11 @@ import {
     recordTokenUsage,
 } from "@/lib/dynamo-quota-manager"
 import {
+    buildGitHubCopilotHeaders,
+    getGitHubCopilotApiBaseUrl,
+    getGitHubCopilotAuthSession,
+} from "@/lib/github-copilot"
+import {
     getTelemetryConfig,
     setTraceInput,
     setTraceOutput,
@@ -41,13 +48,128 @@ import { getUserIdFromRequest } from "@/lib/user-id"
 
 export const maxDuration = 120
 
+function normalizeTextPartStream(
+    stream: ReadableStream<any>,
+): ReadableStream<any> {
+    let activeTextPartId: string | null = null
+
+    return stream.pipeThrough(
+        new TransformStream({
+            transform(chunk, controller) {
+                if (
+                    chunk?.type === "text-start" &&
+                    typeof chunk.id === "string"
+                ) {
+                    // GitHub Copilot Responses can emit a fresh text id for each token.
+                    // Keep a single active text part so the client renders one message block.
+                    if (activeTextPartId) {
+                        return
+                    }
+
+                    activeTextPartId = chunk.id
+                    controller.enqueue(chunk)
+                    return
+                }
+
+                if (
+                    chunk?.type === "text-delta" &&
+                    typeof chunk.id === "string"
+                ) {
+                    if (!activeTextPartId) {
+                        activeTextPartId = chunk.id
+                        controller.enqueue({
+                            type: "text-start",
+                            id: activeTextPartId,
+                        })
+                    }
+
+                    controller.enqueue({ ...chunk, id: activeTextPartId })
+                    return
+                }
+
+                if (
+                    chunk?.type === "text-end" &&
+                    typeof chunk.id === "string"
+                ) {
+                    if (!activeTextPartId) {
+                        activeTextPartId = chunk.id
+                        controller.enqueue({
+                            type: "text-start",
+                            id: activeTextPartId,
+                        })
+                    }
+
+                    controller.enqueue({ ...chunk, id: activeTextPartId })
+                    activeTextPartId = null
+                    return
+                }
+
+                if (activeTextPartId) {
+                    controller.enqueue({
+                        type: "text-end",
+                        id: activeTextPartId,
+                    })
+                    activeTextPartId = null
+                }
+
+                controller.enqueue(chunk)
+            },
+            flush(controller) {
+                if (activeTextPartId) {
+                    controller.enqueue({
+                        type: "text-end",
+                        id: activeTextPartId,
+                    })
+                }
+            },
+        }),
+    )
+}
+
+function normalizeUIMessageChunkOrder(
+    stream: ReadableStream<any>,
+): ReadableStream<any> {
+    return normalizeTextPartStream(stream)
+}
+
+function normalizeLanguageModelTextPartOrder(
+    stream: ReadableStream<any>,
+): ReadableStream<any> {
+    return normalizeTextPartStream(stream)
+}
+
+function wrapModelWithNormalizedTextStream(model: any): any {
+    return wrapLanguageModel({
+        model,
+        middleware: {
+            specificationVersion: "v3",
+            wrapStream: async ({ doStream }) => {
+                const result = await doStream()
+                return {
+                    ...result,
+                    stream: normalizeLanguageModelTextPartOrder(result.stream),
+                }
+            },
+        },
+    })
+}
+
 // Helper function to create cached stream response
 function createCachedStreamResponse(xml: string): Response {
+    const messageId = `msg_${Date.now()}`
     const toolCallId = `cached-${Date.now()}`
+    const textId = `text_${Date.now()}`
 
     const stream = createUIMessageStream({
         execute: async ({ writer }) => {
-            writer.write({ type: "start" })
+            writer.write({ type: "start", messageId })
+            writer.write({ type: "text-start", id: textId })
+            writer.write({
+                type: "text-delta",
+                id: textId,
+                delta: "Creating diagram...",
+            })
+            writer.write({ type: "text-end", id: textId })
             writer.write({
                 type: "tool-input-start",
                 toolCallId,
@@ -71,6 +193,182 @@ function createCachedStreamResponse(xml: string): Response {
     return createUIMessageStreamResponse({ stream })
 }
 
+const SHAPE_LIBRARY_CONTENT_LENGTH_LIMIT = 12000
+const SHAPE_LIBRARY_SHAPE_COUNT_LIMIT = 120
+const SHAPE_LIBRARY_OVERVIEW_CATEGORY_LIMIT = 12
+const SHAPE_LIBRARY_MATCH_CATEGORY_LIMIT = 8
+const SHAPE_LIBRARY_MATCH_SHAPE_LIMIT = 12
+
+type ParsedShapeLibrary = {
+    header: string
+    totalShapes: number | null
+    categories: Array<{
+        name: string
+        count: number | null
+        shapes: string[]
+    }>
+}
+
+function parseShapeLibraryMarkdown(content: string): ParsedShapeLibrary {
+    const headerMatch = content.match(
+        /^[\s\S]*?(?=\n## Shapes(?: \(\d+\))?\n|$)/,
+    )
+    const totalShapesMatch = content.match(/^## Shapes \((\d+)\)$/m)
+    const lines = content.split("\n")
+    const categories: ParsedShapeLibrary["categories"] = []
+    let currentCategory: ParsedShapeLibrary["categories"][number] | null = null
+
+    for (const line of lines) {
+        const categoryMatch = line.match(/^###\s+(.+?)(?:\s+\((\d+)\))?$/)
+        if (categoryMatch) {
+            currentCategory = {
+                name: categoryMatch[1],
+                count: categoryMatch[2] ? Number(categoryMatch[2]) : null,
+                shapes: [],
+            }
+            categories.push(currentCategory)
+            continue
+        }
+
+        const shapeMatch = line.match(/^-\s+`([^`]+)`/)
+        if (shapeMatch && currentCategory) {
+            currentCategory.shapes.push(shapeMatch[1])
+        }
+    }
+
+    return {
+        header: (headerMatch?.[0] || content).trim(),
+        totalShapes: totalShapesMatch ? Number(totalShapesMatch[1]) : null,
+        categories,
+    }
+}
+
+function getShapeLibraryQueryTerms(query: string): string[] {
+    return [
+        ...new Set(
+            query
+                .toLowerCase()
+                .split(/[^a-z0-9]+/)
+                .filter(Boolean),
+        ),
+    ]
+}
+
+function formatShapeLibraryOverview(
+    library: string,
+    parsed: ParsedShapeLibrary,
+): string {
+    const categoryLines = parsed.categories
+        .slice(0, SHAPE_LIBRARY_OVERVIEW_CATEGORY_LIMIT)
+        .map((category) => {
+            const count = category.count ?? category.shapes.length
+            return `- ${category.name} (${count})`
+        })
+        .join("\n")
+
+    const remainingCategories =
+        parsed.categories.length > SHAPE_LIBRARY_OVERVIEW_CATEGORY_LIMIT
+            ? `\n- plus ${parsed.categories.length - SHAPE_LIBRARY_OVERVIEW_CATEGORY_LIMIT} more categories`
+            : ""
+
+    return `${parsed.header}\n\nThis library is large, so this response is intentionally compact to avoid overwhelming the model context.\n\n## Category overview\n${categoryLines}${remainingCategories}\n\nFor exact icon names, call get_shape_library again with a focused query. Example:\n{"library":"${library}","query":"openai kubernetes gateway storage"}`
+}
+
+function formatFocusedShapeLibrary(
+    library: string,
+    parsed: ParsedShapeLibrary,
+    query: string,
+): string {
+    const terms = getShapeLibraryQueryTerms(query)
+    if (terms.length === 0) {
+        return formatShapeLibraryOverview(library, parsed)
+    }
+
+    const matchedCategories = parsed.categories
+        .map((category) => {
+            const categoryName = category.name.toLowerCase()
+            const matchedShapes = category.shapes.filter((shape) => {
+                const normalizedShape = shape.toLowerCase()
+                return terms.some((term) => normalizedShape.includes(term))
+            })
+
+            const score = terms.reduce((total, term) => {
+                const categoryScore = categoryName.includes(term) ? 3 : 0
+                const shapeScore = matchedShapes.some((shape) =>
+                    shape.toLowerCase().includes(term),
+                )
+                    ? 2
+                    : 0
+                return total + categoryScore + shapeScore
+            }, 0)
+
+            return {
+                ...category,
+                matchedShapes,
+                score,
+            }
+        })
+        .filter(
+            (category) =>
+                category.score > 0 || category.matchedShapes.length > 0,
+        )
+        .sort((left, right) => {
+            if (right.score !== left.score) {
+                return right.score - left.score
+            }
+            return right.matchedShapes.length - left.matchedShapes.length
+        })
+        .slice(0, SHAPE_LIBRARY_MATCH_CATEGORY_LIMIT)
+
+    if (matchedCategories.length === 0) {
+        return `${formatShapeLibraryOverview(library, parsed)}\n\nNo exact matches found for query: "${query}". Try different product names, service names, or category keywords.`
+    }
+
+    const sections = matchedCategories
+        .map((category) => {
+            const count = category.count ?? category.shapes.length
+            const shapes = category.matchedShapes.slice(
+                0,
+                SHAPE_LIBRARY_MATCH_SHAPE_LIMIT,
+            )
+            const shapeLines = shapes.map((shape) => `- ${shape}`).join("\n")
+            const hasMore =
+                category.matchedShapes.length > SHAPE_LIBRARY_MATCH_SHAPE_LIMIT
+                    ? `\n- plus ${category.matchedShapes.length - SHAPE_LIBRARY_MATCH_SHAPE_LIMIT} more matches`
+                    : ""
+
+            return `### ${category.name} (${count})\n${shapeLines}${hasMore}`
+        })
+        .join("\n\n")
+
+    return `${parsed.header}\n\n## Focused matches for "${query}"\n${sections}\n\nIf you still need a narrower result, call get_shape_library again with a more specific query.`
+}
+
+function formatShapeLibraryResponse(options: {
+    library: string
+    content: string
+    query?: string
+}): string {
+    const parsed = parseShapeLibraryMarkdown(options.content)
+    const isLargeLibrary =
+        options.content.length > SHAPE_LIBRARY_CONTENT_LENGTH_LIMIT ||
+        (parsed.totalShapes ?? 0) > SHAPE_LIBRARY_SHAPE_COUNT_LIMIT
+
+    if (options.query?.trim()) {
+        return formatFocusedShapeLibrary(
+            options.library,
+            parsed,
+            options.query.trim(),
+        )
+    }
+
+    if (isLargeLibrary) {
+        return formatShapeLibraryOverview(options.library, parsed)
+    }
+
+    return options.content
+}
+
 // Inner handler function
 async function handleChatRequest(req: Request): Promise<Response> {
     // Check for access code
@@ -91,11 +389,41 @@ async function handleChatRequest(req: Request): Promise<Response> {
     }
 
     const body = await req.json()
-    const { messages, xml, previousXml, sessionId } = body
+    const rawMessages = Array.isArray(body.messages) ? body.messages : []
+    const messages = rawMessages.filter(
+        (message: any) =>
+            message &&
+            typeof message === "object" &&
+            typeof message.role === "string",
+    )
+    const { xml, previousXml, sessionId } = body
     const customSystemMessage =
         typeof body.customSystemMessage === "string"
             ? body.customSystemMessage.slice(0, 5000)
             : ""
+
+    if (messages.length !== rawMessages.length) {
+        console.warn(
+            `[route.ts] Dropped ${rawMessages.length - messages.length} invalid incoming message(s) before processing.`,
+        )
+    }
+    const requestedProvider = req.headers.get("x-ai-provider")
+    const requestedBaseUrl = req.headers.get("x-ai-base-url")
+    const requestedModelId = req.headers.get("x-ai-model")
+    const requestedSelectedModelId = req.headers.get("x-selected-model-id")
+    const copilotAuth =
+        requestedProvider === "githubcopilot"
+            ? getGitHubCopilotAuthSession(req)
+            : null
+
+    if (requestedProvider === "githubcopilot" && !copilotAuth) {
+        return Response.json(
+            {
+                error: "GitHub Copilot login required. Connect GitHub Copilot in Model Configuration.",
+            },
+            { status: 401 },
+        )
+    }
 
     // Get user ID for Langfuse tracking and quota
     const userId = getUserIdFromRequest(req)
@@ -113,6 +441,25 @@ async function handleChatRequest(req: Request): Promise<Response> {
         .find((m: any) => m.role === "user")
     const userInputText =
         lastUserMessage?.parts?.find((p: any) => p.type === "text")?.text || ""
+    const lastUserFileParts =
+        lastUserMessage?.parts?.filter((part: any) => part?.type === "file") ||
+        []
+    const hasImageInput = lastUserFileParts.some((part: any) =>
+        typeof part?.mediaType === "string"
+            ? part.mediaType.startsWith("image/")
+            : false,
+    )
+    const imageAttachmentCount = lastUserFileParts.filter((part: any) =>
+        typeof part?.mediaType === "string"
+            ? part.mediaType.startsWith("image/")
+            : false,
+    ).length
+    const pdfAttachmentCount = lastUserFileParts.filter(
+        (part: any) => part?.mediaType === "application/pdf",
+    ).length
+    const shouldUseCopilotResponsesApi =
+        requestedProvider === "githubcopilot" &&
+        shouldUseGitHubCopilotResponsesApi(requestedModelId)
 
     // Update Langfuse trace with input, session, and user
     setTraceInput({
@@ -124,10 +471,11 @@ async function handleChatRequest(req: Request): Promise<Response> {
     // === SERVER-SIDE QUOTA CHECK START ===
     // Quota is opt-in: only enabled when DYNAMODB_QUOTA_TABLE env var is set
     const hasOwnApiKey = !!(
-        req.headers.get("x-ai-provider") &&
+        requestedProvider &&
         (req.headers.get("x-ai-api-key") ||
             req.headers.get("x-aws-access-key-id") ||
-            req.headers.get("x-vertex-api-key"))
+            req.headers.get("x-vertex-api-key") ||
+            (requestedProvider === "githubcopilot" && copilotAuth))
     )
 
     // Skip quota check if: quota disabled, user has own API key, or is anonymous
@@ -176,15 +524,18 @@ async function handleChatRequest(req: Request): Promise<Response> {
     // === CACHE CHECK END ===
 
     // Read client AI provider overrides from headers
-    const provider = req.headers.get("x-ai-provider")
-    let baseUrl = req.headers.get("x-ai-base-url")
-    const selectedModelId = req.headers.get("x-selected-model-id")
+    const provider = requestedProvider
+    let baseUrl = requestedBaseUrl
+    const selectedModelId = requestedSelectedModelId
 
     // For EdgeOne provider, construct full URL from request origin
     // because createOpenAI needs absolute URL, not relative path
     if (provider === "edgeone" && !baseUrl) {
         const origin = req.headers.get("origin") || new URL(req.url).origin
         baseUrl = `${origin}/api/edgeai`
+    }
+    if (provider === "githubcopilot") {
+        baseUrl = getGitHubCopilotApiBaseUrl(copilotAuth?.enterpriseUrl)
     }
 
     // Get cookie header for EdgeOne authentication (eo_token, eo_time)
@@ -215,7 +566,10 @@ async function handleChatRequest(req: Request): Promise<Response> {
         // Server model provider takes precedence over client header
         provider: serverModelConfig.provider || provider,
         baseUrl,
-        apiKey: req.headers.get("x-ai-api-key"),
+        apiKey:
+            provider === "githubcopilot"
+                ? copilotAuth?.accessToken
+                : req.headers.get("x-ai-api-key"),
         modelId: req.headers.get("x-ai-model"),
         // AWS Bedrock credentials
         awsAccessKeyId: req.headers.get("x-aws-access-key-id"),
@@ -227,10 +581,26 @@ async function handleChatRequest(req: Request): Promise<Response> {
         // Vertex AI credentials (Express Mode)
         vertexApiKey: req.headers.get("x-vertex-api-key"),
         // Pass cookies for EdgeOne Pages authentication
-        ...(provider === "edgeone" &&
+        ...((provider === "edgeone" &&
             cookieHeader && {
                 headers: { cookie: cookieHeader },
-            }),
+            }) ||
+            (provider === "githubcopilot" &&
+                copilotAuth && {
+                    preferResponses: shouldUseCopilotResponsesApi,
+                    headers: buildGitHubCopilotHeaders({
+                        token: copilotAuth.accessToken,
+                        initiator:
+                            lastUserMessage?.role === "user" ? "user" : "agent",
+                        isVision: hasImageInput,
+                    }),
+                })),
+    }
+
+    if (provider === "githubcopilot" && lastUserFileParts.length > 0) {
+        console.log(
+            `[GitHub Copilot] attachments detected: total=${lastUserFileParts.length}, images=${imageAttachmentCount}, pdfs=${pdfAttachmentCount}, mode=${shouldUseCopilotResponsesApi ? "responses" : "chat"}`,
+        )
     }
 
     // Read minimal style preference from header
@@ -262,13 +632,9 @@ async function handleChatRequest(req: Request): Promise<Response> {
         : systemMessage
 
     // Extract file parts (images) from the last user message
-    const fileParts =
-        lastUserMessage?.parts?.filter((part: any) => part.type === "file") ||
-        []
-
     // Check if user is sending images to a model that doesn't support them
     // AI SDK silently drops unsupported parts, so we need to catch this early
-    if (fileParts.length > 0 && !supportsImageInput(modelId)) {
+    if (hasImageInput && !supportsImageInput(modelId, resolvedProvider)) {
         return Response.json(
             {
                 error: `The model "${modelId}" does not support image input. Please use a vision-capable model (e.g., GPT-4o, Claude, Gemini) or remove the image.`,
@@ -276,12 +642,6 @@ async function handleChatRequest(req: Request): Promise<Response> {
             { status: 400 },
         )
     }
-
-    // User input only - XML is now in a separate cached system message
-    const formattedUserInput = `User input:
-"""md
-${userInputText}
-"""`
 
     // Convert UIMessages to ModelMessages and add system message
     const modelMessages = await convertToModelMessages(messages)
@@ -316,20 +676,62 @@ ${userInputText}
         }
     })
 
-    // Replace historical tool call XML with placeholders to reduce tokens
-    // Disabled by default - some models (e.g. minimax) copy placeholders instead of generating XML
+    // Replace historical tool call XML with placeholders to reduce tokens.
+    // Keep it enabled for GitHub Copilot because large historical display_diagram
+    // payloads can cause follow-up turns to fail before any content is streamed.
+    // Some providers (e.g. MiniMax) may copy placeholders into output, so they
+    // still require an explicit opt-in via env instead of broad default enablement.
     const enableHistoryReplace =
-        process.env.ENABLE_HISTORY_XML_REPLACE === "true"
+        process.env.ENABLE_HISTORY_XML_REPLACE === "true" ||
+        resolvedProvider === "githubcopilot"
     const placeholderMessages = enableHistoryReplace
         ? replaceHistoricalToolInputs(modelMessages)
         : modelMessages
 
     // Filter out messages with empty content arrays (Bedrock API rejects these)
     // This is a safety measure - ideally convertToModelMessages should handle all cases
-    let enhancedMessages = placeholderMessages.filter(
-        (msg: any) =>
-            msg.content && Array.isArray(msg.content) && msg.content.length > 0,
-    )
+    const lastUserMessageIndex = (() => {
+        for (let i = placeholderMessages.length - 1; i >= 0; i--) {
+            if (placeholderMessages[i].role === "user") {
+                return i
+            }
+        }
+        return -1
+    })()
+
+    let enhancedMessages = placeholderMessages
+        .map((msg: any, idx: number) => {
+            if (msg.role !== "user" || !Array.isArray(msg.content)) {
+                return msg
+            }
+
+            if (idx === lastUserMessageIndex) {
+                return msg
+            }
+
+            const contentWithoutFiles = msg.content.filter(
+                (part: any) => part.type !== "file",
+            )
+
+            return {
+                ...msg,
+                content:
+                    contentWithoutFiles.length > 0
+                        ? contentWithoutFiles
+                        : [
+                              {
+                                  type: "text",
+                                  text: "[Historical attachments omitted from context]",
+                              },
+                          ],
+            }
+        })
+        .filter(
+            (msg: any) =>
+                msg.content &&
+                Array.isArray(msg.content) &&
+                msg.content.length > 0,
+        )
 
     // Filter out tool-calls with invalid inputs (from failed repair or interrupted streaming)
     // Bedrock API rejects messages where toolUse.input is not a valid JSON object
@@ -358,6 +760,17 @@ ${userInputText}
             return { ...msg, content: filteredContent }
         })
         .filter((msg: any) => msg.content && msg.content.length > 0)
+
+    const lastEnhancedUserMessage =
+        resolvedProvider === "githubcopilot"
+            ? [...enhancedMessages]
+                  .reverse()
+                  .find((message: any) => message?.role === "user")
+            : null
+
+    if (resolvedProvider === "githubcopilot" && lastEnhancedUserMessage) {
+        enhancedMessages = [lastEnhancedUserMessage]
+    }
 
     // DEBUG: Log modelMessages structure (what's being sent to AI)
     console.log("[route.ts] Model messages count:", enhancedMessages.length)
@@ -392,19 +805,12 @@ ${userInputText}
     if (enhancedMessages.length >= 1) {
         const lastModelMessage = enhancedMessages[enhancedMessages.length - 1]
         if (lastModelMessage.role === "user") {
-            // Build content array with user input text and file parts
-            const contentParts: any[] = [
-                { type: "text", text: formattedUserInput },
+            const contentParts = [
+                { type: "text", text: userInputText },
+                ...lastModelMessage.content.filter(
+                    (part: any) => part.type !== "text",
+                ),
             ]
-
-            // Add image parts back
-            for (const filePart of fileParts) {
-                contentParts.push({
-                    type: "image",
-                    image: filePart.url,
-                    mimeType: filePart.mediaType,
-                })
-            }
 
             enhancedMessages = [
                 ...enhancedMessages.slice(0, -1),
@@ -412,6 +818,40 @@ ${userInputText}
             ]
         }
     }
+
+    enhancedMessages = enhancedMessages.map((message: any) => {
+        if (!Array.isArray(message.content)) {
+            return message
+        }
+
+        return {
+            ...message,
+            content: message.content.map((part: any) => {
+                if (
+                    part.type !== "file" ||
+                    typeof part.data !== "string" ||
+                    !part.data.startsWith("data:")
+                ) {
+                    return part
+                }
+
+                const commaIndex = part.data.indexOf(",")
+                if (commaIndex === -1) {
+                    return part
+                }
+
+                const header = part.data.slice(5, commaIndex)
+                const mediaType = header.split(";")[0] || part.mediaType
+                const base64Data = part.data.slice(commaIndex + 1)
+
+                return {
+                    ...part,
+                    data: base64Data,
+                    mediaType,
+                }
+            }),
+        }
+    })
 
     // Add cache point to the last assistant message in conversation history
     // This caches the entire conversation prefix for subsequent requests
@@ -485,14 +925,19 @@ IMPORTANT: The "Current diagram XML" is the SINGLE SOURCE OF TRUTH for what's on
           ]
 
     const allMessages = [...systemMessages, ...enhancedMessages]
+    const maxStepCount = hasImageInput ? 10 : 5
 
     const result = streamText({
-        model,
+        model:
+            resolvedProvider === "githubcopilot" &&
+            shouldUseGitHubCopilotResponsesApi(modelId)
+                ? wrapModelWithNormalizedTextStream(model)
+                : model,
         abortSignal: req.signal,
         ...(process.env.MAX_OUTPUT_TOKENS && {
             maxOutputTokens: parseInt(process.env.MAX_OUTPUT_TOKENS, 10),
         }),
-        stopWhen: stepCountIs(5),
+        stopWhen: stepCountIs(maxStepCount),
         // Repair truncated tool calls when maxOutputTokens is reached mid-JSON
         experimental_repairToolCall: async ({ toolCall, error }) => {
             // DEBUG: Log what we're trying to repair
@@ -707,15 +1152,22 @@ Available libraries:
 - Engineering: fluidpower, electrical, pid, cabinets, floorplan
 - Icons: webicons
 
-Call this tool to get shape names and usage syntax for a specific library.`,
+Call this tool to get shape names and usage syntax for a specific library.
+For large libraries such as aws4, azure2, or webicons, first call without query to get a compact overview, then call again with query to find exact shapes.`,
                 inputSchema: z.object({
                     library: z
                         .string()
                         .describe(
                             "Library name (e.g., 'aws4', 'kubernetes', 'flowchart')",
                         ),
+                    query: z
+                        .string()
+                        .optional()
+                        .describe(
+                            "Optional keywords to find relevant shapes within large libraries (e.g., 'openai kubernetes gateway')",
+                        ),
                 }),
-                execute: async ({ library }) => {
+                execute: async ({ library, query }) => {
                     // Sanitize input - prevent path traversal attacks
                     const sanitizedLibrary = library
                         .toLowerCase()
@@ -742,7 +1194,11 @@ Call this tool to get shape names and usage syntax for a specific library.`,
 
                     try {
                         const content = await fs.readFile(filePath, "utf-8")
-                        return content
+                        return formatShapeLibraryResponse({
+                            library: sanitizedLibrary,
+                            content,
+                            query,
+                        })
                     } catch (error) {
                         if (
                             (error as NodeJS.ErrnoException).code === "ENOENT"
@@ -763,7 +1219,7 @@ Call this tool to get shape names and usage syntax for a specific library.`,
         }),
     })
 
-    return result.toUIMessageStreamResponse({
+    const uiMessageStream = result.toUIMessageStream({
         sendReasoning: true,
         messageMetadata: ({ part }) => {
             if (part.type === "finish") {
@@ -777,6 +1233,10 @@ Call this tool to get shape names and usage syntax for a specific library.`,
             return undefined
         },
     })
+
+    return createUIMessageStreamResponse({
+        stream: normalizeUIMessageChunkOrder(uiMessageStream),
+    })
 }
 
 // Helper to categorize errors and return appropriate response
@@ -787,6 +1247,15 @@ function handleError(error: unknown): Response {
 
     // Check for specific AI SDK error types
     if (APICallError.isInstance(error)) {
+        console.error("[APICallError]", {
+            message: error.message,
+            statusCode: error.statusCode,
+            url: error.url,
+            responseBody: error.responseBody,
+            isRetryable: error.isRetryable,
+            data: error.data,
+        })
+
         return Response.json(
             {
                 error: error.message,

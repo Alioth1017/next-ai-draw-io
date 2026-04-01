@@ -86,7 +86,7 @@ describe("isMinimalDiagram", () => {
 })
 
 describe("replaceHistoricalToolInputs", () => {
-    it("replaces display_diagram tool inputs with placeholder", () => {
+    it("replaces display_diagram tool inputs with placeholder text", () => {
         const messages = [
             {
                 role: "assistant",
@@ -100,12 +100,13 @@ describe("replaceHistoricalToolInputs", () => {
             },
         ]
         const result = replaceHistoricalToolInputs(messages)
-        expect(result[0].content[0].input.placeholder).toContain(
-            "XML content replaced",
-        )
+        expect(result[0].content[0]).toEqual({
+            type: "text",
+            text: "[Historical diagram tool call omitted - use current diagram XML in system context]",
+        })
     })
 
-    it("replaces edit_diagram tool inputs with placeholder", () => {
+    it("replaces edit_diagram tool inputs with placeholder text", () => {
         const messages = [
             {
                 role: "assistant",
@@ -119,9 +120,53 @@ describe("replaceHistoricalToolInputs", () => {
             },
         ]
         const result = replaceHistoricalToolInputs(messages)
-        expect(result[0].content[0].input.placeholder).toContain(
-            "XML content replaced",
-        )
+        expect(result[0].content[0]).toEqual({
+            type: "text",
+            text: "[Historical diagram tool call omitted - use current diagram XML in system context]",
+        })
+    })
+
+    it("keeps only one placeholder for multiple historical diagram tool calls", () => {
+        const messages = [
+            {
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool-call",
+                        toolName: "display_diagram",
+                        input: { xml: "<mxCell...>" },
+                    },
+                    {
+                        type: "tool-call",
+                        toolName: "append_diagram",
+                        input: { xml: "<mxCell more...>" },
+                    },
+                ],
+            },
+        ]
+        const result = replaceHistoricalToolInputs(messages)
+        expect(result[0].content).toHaveLength(1)
+        expect(result[0].content[0]).toEqual({
+            type: "text",
+            text: "[Historical diagram tool call omitted - use current diagram XML in system context]",
+        })
+    })
+
+    it("removes historical diagram tool results", () => {
+        const messages = [
+            {
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool-result",
+                        toolName: "display_diagram",
+                        result: { ok: true },
+                    },
+                ],
+            },
+        ]
+        const result = replaceHistoricalToolInputs(messages)
+        expect(result[0].content).toHaveLength(0)
     })
 
     it("removes tool calls with invalid inputs", () => {

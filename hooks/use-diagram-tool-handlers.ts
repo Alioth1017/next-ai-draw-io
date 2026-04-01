@@ -7,7 +7,11 @@ import type {
 } from "@/components/chat/ValidationCard"
 import type { ValidationResult } from "@/lib/diagram-validator"
 import { formatValidationFeedback } from "@/lib/diagram-validator"
-import { isMxCellXmlComplete, wrapWithMxFile } from "@/lib/utils"
+import {
+    convertToLegalXml,
+    isMxCellXmlComplete,
+    wrapWithMxFile,
+} from "@/lib/utils"
 
 const DEBUG = process.env.NODE_ENV === "development"
 
@@ -178,7 +182,28 @@ NEXT STEP: Call append_diagram with the continuation XML.
         const fullXml = wrapWithMxFile(finalXml)
 
         // loadDiagram validates and returns error if invalid
-        const validationError = onDisplayChart(fullXml)
+        let validationError = onDisplayChart(fullXml)
+
+        if (validationError) {
+            const normalizedXml = convertToLegalXml(finalXml)
+            const fallbackXml = wrapWithMxFile(normalizedXml)
+
+            if (DEBUG) {
+                console.log(
+                    "[display_diagram] Retrying with normalized XML fallback",
+                )
+            }
+
+            validationError = onDisplayChart(fallbackXml)
+
+            if (!validationError) {
+                if (DEBUG) {
+                    console.log(
+                        "[display_diagram] Normalized XML fallback succeeded",
+                    )
+                }
+            }
+        }
 
         if (validationError) {
             console.warn("[display_diagram] Validation error:", validationError)

@@ -51,9 +51,10 @@ parameters: {
 }
 ---Tool4---
 tool name: get_shape_library
-description: Get shape/icon library documentation. Use this to discover available icon shapes (AWS, Azure, GCP, Kubernetes, Material Design, etc.) before creating diagrams with special icons. ALWAYS call this before using any icon library — never guess the syntax.
+description: Get shape/icon library documentation. Use this to discover available icon shapes (AWS, Azure, GCP, Kubernetes, Material Design, etc.) before creating diagrams with special icons. ALWAYS call this before using any icon library — never guess the syntax. For very large libraries, first request the overview, then make a second focused query for the exact services you need.
 parameters: {
   library: string  // Library name: aws4, azure2, gcp2, kubernetes, cisco19, flowchart, bpmn, material_design, etc.
+  query?: string   // Optional keywords for exact icon lookup in large libraries, e.g. "openai kubernetes gateway"
 }
 ---End of tools---
 
@@ -61,7 +62,7 @@ IMPORTANT: Choose the right tool:
 - Use display_diagram for: Creating new diagrams, major restructuring, or when the current diagram XML is empty
 - Use edit_diagram for: Small modifications, adding/removing elements, changing text/colors, repositioning items
 - Use append_diagram for: ONLY when display_diagram was truncated due to output length - continue generating from where you stopped
-- Use get_shape_library for: Discovering available icons/shapes when creating diagrams with any icon library (cloud, material design, etc.) — call BEFORE display_diagram
+- Use get_shape_library for: Discovering available icons/shapes when creating diagrams with any icon library (cloud, material design, etc.) — call BEFORE display_diagram. For large libraries, fetch overview first, then focused query results.
 
 Core capabilities:
 - Generate valid, well-formed XML strings for draw.io diagrams
@@ -93,6 +94,7 @@ Note that:
 - Return XML only via tool calls, never in text responses.
 - If user asks you to replicate a diagram based on an image, remember to match the diagram style and layout as closely as possible. Especially, pay attention to the lines and shapes, for example, if the lines are straight or curved, and if the shapes are rounded or square.
 - For cloud/tech diagrams (AWS, Azure, GCP, K8s) or when using icon libraries (material_design, webicons, etc.), call get_shape_library first to discover available icon shapes and their correct syntax. NEVER guess icon style syntax — always look it up first.
+- For large libraries such as aws4, azure2, and webicons, do not request the full catalog repeatedly. First request the overview, then issue focused queries with exact product or service keywords taken from the user's prompt or image.
 - NEVER include XML comments (<!-- ... -->) in your generated XML. Draw.io strips comments, which breaks edit_diagram patterns.
 
 When using edit_diagram tool:

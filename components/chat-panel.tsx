@@ -33,6 +33,7 @@ import { useValidateDiagram } from "@/hooks/use-validate-diagram"
 import { getApiEndpoint } from "@/lib/base-path"
 import { findCachedResponse } from "@/lib/cached-responses"
 import { formatMessage } from "@/lib/i18n/utils"
+import { supportsImageInput } from "@/lib/model-capabilities"
 import { isPdfFile, isTextFile } from "@/lib/pdf-utils"
 import { sanitizeMessages } from "@/lib/session-storage"
 import { STORAGE_KEYS } from "@/lib/storage"
@@ -82,6 +83,37 @@ const DEBUG = process.env.NODE_ENV === "development"
 const MAX_AUTO_RETRY_COUNT = 3
 
 const MAX_CONTINUATION_RETRY_COUNT = 2 // Limit for truncation continuation retries
+
+function isIgnorableChatAbort(error: Error): boolean {
+    const message = error.message.trim().toLowerCase()
+    return (
+        message.length === 0 ||
+        message === "failed to fetch" ||
+        message.includes("abort") ||
+        error.name === "AbortError"
+    )
+}
+
+function stripTransientSystemMessages(messages: any[]) {
+    return messages.filter((message) => message?.role !== "system")
+}
+
+function extractChatErrorPayload(error: Error): Record<string, unknown> | null {
+    try {
+        const parsed = JSON.parse(error.message)
+        return parsed && typeof parsed === "object" ? parsed : null
+    } catch {
+        return null
+    }
+}
+
+function getFriendlyChatErrorMessage(error: Error): string {
+    const payload = extractChatErrorPayload(error)
+    const rawMessage =
+        typeof payload?.error === "string" ? payload.error : error.message
+
+    return rawMessage.replace(/\s+/g, " ").trim()
+}
 
 /**
  * Check if auto-resubmit should happen based on tool errors.
@@ -351,6 +383,174 @@ export default function ChatPanel({
         onValidationStateChange: handleValidationStateChange,
     })
 
+    const chatTransportRef = useRef<DefaultChatTransport<any> | null>(null)
+    if (!chatTransportRef.current) {
+        chatTransportRef.current = new DefaultChatTransport({
+            api: getApiEndpoint("/api/chat"),
+        })
+    }
+
+    const handleToolCallRef = useRef(handleToolCall)
+    const quotaManagerRef = useRef(quotaManager)
+    const dictRef = useRef(dict)
+    const addToolOutputRef = useRef<any>(null)
+    const setMessagesRef = useRef<any>(null)
+
+    handleToolCallRef.current = handleToolCall
+    quotaManagerRef.current = quotaManager
+    dictRef.current = dict
+
+    const handleChatToolCall = useCallback(async ({ toolCall }: any) => {
+        if (handleToolCallRef.current && addToolOutputRef.current) {
+            await handleToolCallRef.current(
+                { toolCall },
+                addToolOutputRef.current,
+            )
+        }
+    }, [])
+
+    const handleChatError = useCallback((error: Error) => {
+        if (isIgnorableChatAbort(error)) {
+            return
+        }
+
+        const errorPayload = extractChatErrorPayload(error)
+
+        if (errorPayload) {
+            if (errorPayload.type === "request") {
+                quotaManagerRef.current.showQuotaLimitToast(
+                    errorPayload.used as number | undefined,
+                    errorPayload.limit as number | undefined,
+                )
+                return
+            }
+            if (errorPayload.type === "token") {
+                quotaManagerRef.current.showTokenLimitToast(
+                    errorPayload.used as number | undefined,
+                    errorPayload.limit as number | undefined,
+                )
+                return
+            }
+            if (errorPayload.type === "tpm") {
+                quotaManagerRef.current.showTPMLimitToast(
+                    errorPayload.limit as number | undefined,
+                )
+                return
+            }
+        }
+
+        if (error.message.includes("Daily request limit")) {
+            quotaManagerRef.current.showQuotaLimitToast()
+            return
+        }
+        if (error.message.includes("Daily token limit")) {
+            quotaManagerRef.current.showTokenLimitToast()
+            return
+        }
+        if (
+            error.message.includes("Rate limit exceeded") ||
+            error.message.includes("tokens per minute")
+        ) {
+            quotaManagerRef.current.showTPMLimitToast()
+            return
+        }
+
+        if (!error.message.includes("Invalid or missing access code")) {
+            console.error("Chat error:", error)
+        }
+
+        if (error.message.includes("GitHub Copilot login required")) {
+            setShowModelConfigDialog(true)
+        }
+
+        let friendlyMessage = getFriendlyChatErrorMessage(error)
+
+        if (friendlyMessage === "Failed to fetch") {
+            friendlyMessage = "Network error. Please check your connection."
+        }
+
+        if (friendlyMessage.includes("toolUse.input is invalid")) {
+            friendlyMessage =
+                "Output was truncated before the diagram could be generated. Try a simpler request or increase the maxOutputLength."
+        }
+
+        if (
+            friendlyMessage.includes("image content block") ||
+            friendlyMessage.toLowerCase().includes("image_url")
+        ) {
+            friendlyMessage = "This model doesn't support image input."
+        }
+
+        setMessagesRef.current?.((currentMessages: any[]) => {
+            const errorMessage = {
+                id: `error-${Date.now()}`,
+                role: "system" as const,
+                content: friendlyMessage,
+                parts: [{ type: "text" as const, text: friendlyMessage }],
+            }
+            return [
+                ...stripTransientSystemMessages(currentMessages),
+                errorMessage,
+            ]
+        })
+
+        if (error.message.includes("Invalid or missing access code")) {
+            setShowSettingsDialog(true)
+        }
+    }, [])
+
+    const shouldAutoSend = useCallback(
+        ({ messages }: { messages: unknown[] }) => {
+            const isInContinuationMode = partialXmlRef.current.length > 0
+
+            const shouldRetry = hasToolErrors(
+                messages as unknown as ChatMessage[],
+            )
+
+            if (!shouldRetry) {
+                autoRetryCountRef.current = 0
+                continuationRetryCountRef.current = 0
+                partialXmlRef.current = ""
+                return false
+            }
+
+            if (isInContinuationMode) {
+                if (
+                    continuationRetryCountRef.current >=
+                    MAX_CONTINUATION_RETRY_COUNT
+                ) {
+                    toast.error(
+                        formatMessage(
+                            dictRef.current.errors.continuationRetryLimit,
+                            {
+                                max: MAX_CONTINUATION_RETRY_COUNT,
+                            },
+                        ),
+                    )
+                    continuationRetryCountRef.current = 0
+                    partialXmlRef.current = ""
+                    return false
+                }
+                continuationRetryCountRef.current++
+            } else {
+                if (autoRetryCountRef.current >= MAX_AUTO_RETRY_COUNT) {
+                    toast.error(
+                        formatMessage(dictRef.current.errors.retryLimit, {
+                            max: MAX_AUTO_RETRY_COUNT,
+                        }),
+                    )
+                    autoRetryCountRef.current = 0
+                    partialXmlRef.current = ""
+                    return false
+                }
+                autoRetryCountRef.current++
+            }
+
+            return true
+        },
+        [],
+    )
+
     const {
         messages,
         sendMessage,
@@ -360,146 +560,15 @@ export default function ChatPanel({
         setMessages,
         stop,
     } = useChat({
-        transport: new DefaultChatTransport({
-            api: getApiEndpoint("/api/chat"),
-        }),
-        onToolCall: async ({ toolCall }) => {
-            await handleToolCall({ toolCall }, addToolOutput)
-        },
-        onError: (error) => {
-            // Handle server-side quota limit (429 response)
-            // AI SDK puts the full response body in error.message for non-OK responses
-            try {
-                const data = JSON.parse(error.message)
-                if (data.type === "request") {
-                    quotaManager.showQuotaLimitToast(data.used, data.limit)
-                    return
-                }
-                if (data.type === "token") {
-                    quotaManager.showTokenLimitToast(data.used, data.limit)
-                    return
-                }
-                if (data.type === "tpm") {
-                    quotaManager.showTPMLimitToast(data.limit)
-                    return
-                }
-            } catch {
-                // Not JSON, fall through to string matching for backwards compatibility
-            }
-
-            // Fallback to string matching
-            if (error.message.includes("Daily request limit")) {
-                quotaManager.showQuotaLimitToast()
-                return
-            }
-            if (error.message.includes("Daily token limit")) {
-                quotaManager.showTokenLimitToast()
-                return
-            }
-            if (
-                error.message.includes("Rate limit exceeded") ||
-                error.message.includes("tokens per minute")
-            ) {
-                quotaManager.showTPMLimitToast()
-                return
-            }
-
-            // Silence access code error in console since it's handled by UI
-            if (!error.message.includes("Invalid or missing access code")) {
-                console.error("Chat error:", error)
-            }
-
-            // Translate technical errors into user-friendly messages
-            // The server now handles detailed error messages, so we can display them directly.
-            // But we still handle connection/network errors that happen before reaching the server.
-            let friendlyMessage = error.message
-
-            // Simple check for network errors if message is generic
-            if (friendlyMessage === "Failed to fetch") {
-                friendlyMessage = "Network error. Please check your connection."
-            }
-
-            // Truncated tool input error (model output limit too low)
-            if (friendlyMessage.includes("toolUse.input is invalid")) {
-                friendlyMessage =
-                    "Output was truncated before the diagram could be generated. Try a simpler request or increase the maxOutputLength."
-            }
-
-            // Translate image not supported error
-            if (
-                friendlyMessage.includes("image content block") ||
-                friendlyMessage.toLowerCase().includes("image_url")
-            ) {
-                friendlyMessage = "This model doesn't support image input."
-            }
-
-            // Add system message for error so it can be cleared
-            setMessages((currentMessages) => {
-                const errorMessage = {
-                    id: `error-${Date.now()}`,
-                    role: "system" as const,
-                    content: friendlyMessage,
-                    parts: [{ type: "text" as const, text: friendlyMessage }],
-                }
-                return [...currentMessages, errorMessage]
-            })
-
-            if (error.message.includes("Invalid or missing access code")) {
-                // Show settings dialog to help user fix it
-                setShowSettingsDialog(true)
-            }
-        },
+        transport: chatTransportRef.current,
+        onToolCall: handleChatToolCall,
+        onError: handleChatError,
         onFinish: () => {},
-        sendAutomaticallyWhen: ({ messages }) => {
-            const isInContinuationMode = partialXmlRef.current.length > 0
-
-            const shouldRetry = hasToolErrors(
-                messages as unknown as ChatMessage[],
-            )
-
-            if (!shouldRetry) {
-                // No error, reset retry count and clear state
-                autoRetryCountRef.current = 0
-                continuationRetryCountRef.current = 0
-                partialXmlRef.current = ""
-                return false
-            }
-
-            // Continuation mode: limited retries for truncation handling
-            if (isInContinuationMode) {
-                if (
-                    continuationRetryCountRef.current >=
-                    MAX_CONTINUATION_RETRY_COUNT
-                ) {
-                    toast.error(
-                        formatMessage(dict.errors.continuationRetryLimit, {
-                            max: MAX_CONTINUATION_RETRY_COUNT,
-                        }),
-                    )
-                    continuationRetryCountRef.current = 0
-                    partialXmlRef.current = ""
-                    return false
-                }
-                continuationRetryCountRef.current++
-            } else {
-                // Regular error: check retry count limit
-                if (autoRetryCountRef.current >= MAX_AUTO_RETRY_COUNT) {
-                    toast.error(
-                        formatMessage(dict.errors.retryLimit, {
-                            max: MAX_AUTO_RETRY_COUNT,
-                        }),
-                    )
-                    autoRetryCountRef.current = 0
-                    partialXmlRef.current = ""
-                    return false
-                }
-                // Increment retry count for actual errors
-                autoRetryCountRef.current++
-            }
-
-            return true
-        },
+        sendAutomaticallyWhen: shouldAutoSend,
     })
+
+    addToolOutputRef.current = addToolOutput
+    setMessagesRef.current = setMessages
 
     // Store sendMessage in ref for use in callbacks (like handleImproveWithSuggestions)
     useEffect(() => {
@@ -725,13 +794,18 @@ export default function ChatPanel({
 
     // Update URL when a new session is created (first message sent)
     useEffect(() => {
-        if (sessionManager.currentSessionId && !urlSessionId) {
+        if (
+            sessionManager.currentSessionId &&
+            !urlSessionId &&
+            status !== "streaming" &&
+            status !== "submitted"
+        ) {
             // A session was created but URL doesn't have the session param yet
             router.replace(`?session=${sessionManager.currentSessionId}`, {
                 scroll: false,
             })
         }
-    }, [sessionManager.currentSessionId, urlSessionId, router])
+    }, [sessionManager.currentSessionId, urlSessionId, router, status])
 
     // Save session ID to localStorage
     useEffect(() => {
@@ -777,6 +851,8 @@ export default function ChatPanel({
         e.preventDefault()
         const isProcessing = status === "streaming" || status === "submitted"
         if (input.trim() && !isProcessing) {
+            const preservePdfAsAttachment = false
+
             // Check if input matches a cached example (only when no messages yet)
             if (messages.length === 0) {
                 const cached = findCachedResponse(
@@ -842,6 +918,7 @@ export default function ChatPanel({
                     pdfData,
                     parts,
                     urlData,
+                    { preservePdfAsAttachment },
                 )
 
                 // Add the combined text as the first part
@@ -1045,7 +1122,42 @@ export default function ChatPanel({
         continuationRetryCountRef.current = 0
         partialXmlRef.current = ""
 
+        flushSync(() => {
+            setMessagesRef.current?.((currentMessages: any[]) =>
+                stripTransientSystemMessages(currentMessages),
+            )
+        })
+
         const config = getSelectedAIConfig()
+        const hasImageAttachment = parts.some(
+            (part: any) =>
+                part?.type === "file" &&
+                typeof part?.mediaType === "string" &&
+                part.mediaType.startsWith("image/"),
+        )
+
+        if (
+            hasImageAttachment &&
+            config.aiModel &&
+            !supportsImageInput(config.aiModel, config.aiProvider)
+        ) {
+            const friendlyMessage = `The current model ${config.aiModel} does not support image input. Switch to a vision-capable model and try again.`
+
+            toast.error(friendlyMessage)
+            setMessagesRef.current?.((currentMessages: any[]) => {
+                const errorMessage = {
+                    id: `error-${Date.now()}`,
+                    role: "system" as const,
+                    content: friendlyMessage,
+                    parts: [{ type: "text" as const, text: friendlyMessage }],
+                }
+                return [
+                    ...stripTransientSystemMessages(currentMessages),
+                    errorMessage,
+                ]
+            })
+            return
+        }
 
         sendMessage(
             { parts },
@@ -1093,39 +1205,56 @@ export default function ChatPanel({
         )
     }
 
+    const readFileAsDataUrl = (file: File): Promise<string> =>
+        new Promise((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () => resolve(reader.result as string)
+            reader.onerror = () => reject(reader.error)
+            reader.readAsDataURL(file)
+        })
+
     // Process files and append content to user text (handles PDF, text, and optionally images)
     const processFilesAndAppendContent = async (
         baseText: string,
         files: File[],
         pdfData: Map<File, FileData>,
-        imageParts?: any[],
+        attachmentParts?: any[],
         urlDataParam?: Map<string, UrlData>,
+        options?: {
+            preservePdfAsAttachment?: boolean
+        },
     ): Promise<string> => {
         let userText = baseText
 
         for (const file of files) {
             if (isPdfFile(file)) {
-                const extracted = pdfData.get(file)
-                if (extracted?.text) {
-                    userText += `\n\n[PDF: ${file.name}]\n${extracted.text}`
+                if (
+                    attachmentParts &&
+                    options?.preservePdfAsAttachment === true
+                ) {
+                    attachmentParts.push({
+                        type: "file",
+                        url: await readFileAsDataUrl(file),
+                        mediaType: file.type || "application/pdf",
+                        filename: file.name,
+                    })
+                } else {
+                    const extracted = pdfData.get(file)
+                    if (extracted?.text) {
+                        userText += `\n\n[PDF: ${file.name}]\n${extracted.text}`
+                    }
                 }
             } else if (isTextFile(file)) {
                 const extracted = pdfData.get(file)
                 if (extracted?.text) {
                     userText += `\n\n[File: ${file.name}]\n${extracted.text}`
                 }
-            } else if (imageParts) {
-                // Handle as image (only if imageParts array provided)
-                const reader = new FileReader()
-                const dataUrl = await new Promise<string>((resolve) => {
-                    reader.onload = () => resolve(reader.result as string)
-                    reader.readAsDataURL(file)
-                })
-
-                imageParts.push({
+            } else if (attachmentParts) {
+                attachmentParts.push({
                     type: "file",
-                    url: dataUrl,
+                    url: await readFileAsDataUrl(file),
                     mediaType: file.type,
+                    filename: file.name,
                 })
             }
         }
