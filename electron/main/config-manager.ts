@@ -63,7 +63,7 @@ function encryptValue(value: string): string {
  * Returns the original value if it's not encrypted or decryption fails
  */
 function decryptValue(value: string): string {
-    if (!value || !value.startsWith(ENCRYPTED_PREFIX)) {
+    if (!value?.startsWith(ENCRYPTED_PREFIX)) {
         return value
     }
     if (!isEncryptionAvailable()) {

@@ -326,7 +326,7 @@ export function convertToLegalXml(xmlString: string): string {
 export function wrapWithMxFile(xml: string): string {
     const ROOT_CELLS = '<mxCell id="0"/><mxCell id="1" parent="0"/>'
 
-    if (!xml || !xml.trim()) {
+    if (!xml?.trim()) {
         return `<mxfile><diagram name="Page-1" id="page-1"><mxGraphModel><root>${ROOT_CELLS}</root></mxGraphModel></diagram></mxfile>`
     }
 

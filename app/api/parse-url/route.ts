@@ -85,7 +85,7 @@ export async function POST(req: Request) {
             clearTimeout(timeoutId)
         }
 
-        if (!article || !article.content) {
+        if (!article?.content) {
             return NextResponse.json(
                 { error: "Could not extract content from URL" },
                 { status: 400 },

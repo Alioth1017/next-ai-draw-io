@@ -84,13 +84,16 @@ const MAX_AUTO_RETRY_COUNT = 3
 
 const MAX_CONTINUATION_RETRY_COUNT = 2 // Limit for truncation continuation retries
 
-function isIgnorableChatAbort(error: Error): boolean {
+function isIgnorableChatAbort(
+    error: Error,
+    wasUserInitiatedAbort: boolean,
+): boolean {
     const message = error.message.trim().toLowerCase()
     return (
-        message.length === 0 ||
-        message === "failed to fetch" ||
-        message.includes("abort") ||
-        error.name === "AbortError"
+        wasUserInitiatedAbort &&
+        (message === "failed to fetch" ||
+            message.includes("abort") ||
+            error.name === "AbortError")
     )
 }
 
@@ -286,6 +289,7 @@ export default function ChatPanel({
     const chartXMLRef = useRef(chartXML)
     // Track session ID that was loaded without a diagram (to prevent thumbnail contamination)
     const justLoadedSessionIdRef = useRef<string | null>(null)
+    const userInitiatedAbortRef = useRef(false)
     useEffect(() => {
         chartXMLRef.current = chartXML
         // Clear the no-diagram flag when a diagram is generated
@@ -410,9 +414,12 @@ export default function ChatPanel({
     }, [])
 
     const handleChatError = useCallback((error: Error) => {
-        if (isIgnorableChatAbort(error)) {
+        if (isIgnorableChatAbort(error, userInitiatedAbortRef.current)) {
+            userInitiatedAbortRef.current = false
             return
         }
+
+        userInitiatedAbortRef.current = false
 
         const errorPayload = extractChatErrorPayload(error)
 
@@ -465,6 +472,9 @@ export default function ChatPanel({
 
         let friendlyMessage = getFriendlyChatErrorMessage(error)
 
+        if (friendlyMessage.length === 0) {
+            friendlyMessage = "Network error. Please check your connection."
+        }
         if (friendlyMessage === "Failed to fetch") {
             friendlyMessage = "Network error. Please check your connection."
         }
@@ -480,6 +490,8 @@ export default function ChatPanel({
         ) {
             friendlyMessage = "This model doesn't support image input."
         }
+
+        toast.error(friendlyMessage)
 
         setMessagesRef.current?.((currentMessages: any[]) => {
             const errorMessage = {
@@ -1108,6 +1120,7 @@ export default function ChatPanel({
 
     // Handle stop button click
     const handleStop = useCallback(() => {
+        userInitiatedAbortRef.current = true
         const lastMessage = messages[messages.length - 1]
         const toolParts = lastMessage?.parts?.filter(
             (part: any) =>
