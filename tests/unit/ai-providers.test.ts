@@ -5,6 +5,10 @@ import {
     supportsImageInput,
     supportsPromptCaching,
 } from "@/lib/ai-providers"
+import {
+    isGitHubCopilotResponsesNotFoundError,
+    isGitHubCopilotResponsesOnlyModel,
+} from "@/lib/github-copilot"
 
 describe("resolveBaseURL", () => {
     const SERVER_BASE_URL = "https://server-proxy.example.com"
@@ -225,6 +229,61 @@ describe("supportsImageInput", () => {
         expect(supportsImageInput("claude-sonnet-4-5")).toBe(true)
         expect(supportsImageInput("gpt-4o")).toBe(true)
         expect(supportsImageInput("gemini-pro")).toBe(true)
+    })
+})
+
+describe("isGitHubCopilotResponsesNotFoundError", () => {
+    it("returns true for GitHub Copilot /responses 404 not_found errors", () => {
+        expect(
+            isGitHubCopilotResponsesNotFoundError({
+                url: "https://api.githubcopilot.com/responses",
+                statusCode: 404,
+                responseBody: '{"error":{"message":"","code":"not_found"}}',
+            }),
+        ).toBe(true)
+    })
+
+    it("returns false for non-responses errors", () => {
+        expect(
+            isGitHubCopilotResponsesNotFoundError({
+                url: "https://api.githubcopilot.com/chat/completions",
+                statusCode: 404,
+                responseBody: '{"error":{"message":"","code":"not_found"}}',
+            }),
+        ).toBe(false)
+    })
+
+    it("returns false for other status codes", () => {
+        expect(
+            isGitHubCopilotResponsesNotFoundError({
+                url: "https://api.githubcopilot.com/responses",
+                statusCode: 401,
+                responseBody: '{"error":{"message":"","code":"unauthorized"}}',
+            }),
+        ).toBe(false)
+    })
+})
+
+describe("isGitHubCopilotResponsesOnlyModel", () => {
+    it("returns true when the model only exposes /responses", () => {
+        expect(
+            isGitHubCopilotResponsesOnlyModel({
+                supportedEndpoints: ["/responses"],
+            }),
+        ).toBe(true)
+    })
+
+    it("returns false when /chat/completions is available", () => {
+        expect(
+            isGitHubCopilotResponsesOnlyModel({
+                supportedEndpoints: ["/chat/completions"],
+            }),
+        ).toBe(false)
+        expect(
+            isGitHubCopilotResponsesOnlyModel({
+                supportedEndpoints: ["/chat/completions", "/responses"],
+            }),
+        ).toBe(false)
     })
 })
 

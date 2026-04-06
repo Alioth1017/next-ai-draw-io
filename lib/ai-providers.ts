@@ -893,7 +893,7 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
             })
 
             const useResponses =
-                overrides?.preferResponses === true ||
+                overrides?.preferResponses ??
                 shouldUseGitHubCopilotResponsesApi(copilotModelId)
 
             model = useResponses

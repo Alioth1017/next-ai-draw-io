@@ -9,6 +9,27 @@ const DEVICE_COOKIE_MAX_AGE = 60 * 15
 const USER_AGENT = "next-ai-draw-io/github-copilot"
 const GITHUB_PUBLIC_HOST = "github.com"
 const DEFAULT_ALLOWED_GITHUB_ENTERPRISE_HOST_PATTERNS = ["*.ghe.com"]
+const COPILOT_MODELS_CACHE_TTL_MS = 5 * 60 * 1000
+
+type GitHubCopilotModelCatalogEntry = {
+    id?: string
+    supported_endpoints?: string[]
+    capabilities?: {
+        supports?: {
+            vision?: boolean
+        }
+    }
+}
+
+type GitHubCopilotModelsCacheEntry = {
+    expiresAt: number
+    models: GitHubCopilotModelMetadata[]
+}
+
+const gitHubCopilotModelsCache = new Map<
+    string,
+    GitHubCopilotModelsCacheEntry
+>()
 
 export interface GitHubCopilotAuthSession {
     accessToken: string
@@ -24,6 +45,12 @@ export interface GitHubCopilotDeviceSession {
     verificationUri: string
     interval: number
     enterpriseUrl?: string
+}
+
+export interface GitHubCopilotModelMetadata {
+    modelId: string
+    supportedEndpoints: string[]
+    supportsVision: boolean
 }
 
 function getAllowedGitHubEnterpriseHosts(): string[] {
@@ -400,6 +427,141 @@ export function buildGitHubCopilotHeaders(input: {
         "x-initiator": input.initiator || "agent",
         ...(input.isVision ? { "Copilot-Vision-Request": "true" } : {}),
         ...(input.extraHeaders || {}),
+    }
+}
+
+export function isGitHubCopilotResponsesOnlyModel(
+    model:
+        | Pick<GitHubCopilotModelMetadata, "supportedEndpoints">
+        | null
+        | undefined,
+): boolean {
+    if (!model) {
+        return false
+    }
+
+    const supportedEndpoints = new Set(model.supportedEndpoints)
+    return (
+        supportedEndpoints.has("/responses") &&
+        !supportedEndpoints.has("/chat/completions")
+    )
+}
+
+function getGitHubCopilotModelsCacheKey(input: {
+    token: string
+    enterpriseUrl?: string
+}): string {
+    const enterpriseHost = normalizeGitHubEnterpriseHost(input.enterpriseUrl)
+    return `${enterpriseHost || GITHUB_PUBLIC_HOST}:${input.token}`
+}
+
+export async function fetchGitHubCopilotModelMetadata(input: {
+    token: string
+    enterpriseUrl?: string
+    fetchImpl?: typeof fetch
+}): Promise<GitHubCopilotModelMetadata[]> {
+    const cacheKey = getGitHubCopilotModelsCacheKey(input)
+    const cached = gitHubCopilotModelsCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) {
+        return cached.models
+    }
+
+    const fetchImpl = input.fetchImpl || fetch
+    const response = await fetchImpl(
+        `${getGitHubCopilotApiBaseUrl(input.enterpriseUrl)}/models`,
+        {
+            headers: {
+                ...buildGitHubCopilotHeaders({
+                    token: input.token,
+                    initiator: "user",
+                }),
+                "X-Github-Api-Version": "2025-10-01",
+            },
+            cache: "no-store",
+        },
+    )
+
+    if (!response.ok) {
+        throw new Error(
+            `Failed to fetch GitHub Copilot models: ${response.status}`,
+        )
+    }
+
+    const payload = (await response.json()) as {
+        data?: GitHubCopilotModelCatalogEntry[]
+    }
+
+    const models = Array.isArray(payload.data)
+        ? payload.data
+              .filter(
+                  (
+                      item,
+                  ): item is GitHubCopilotModelCatalogEntry & { id: string } =>
+                      typeof item.id === "string" && item.id.length > 0,
+              )
+              .map((item) => ({
+                  modelId: item.id,
+                  supportedEndpoints: Array.isArray(item.supported_endpoints)
+                      ? item.supported_endpoints.filter(
+                            (endpoint): endpoint is string =>
+                                typeof endpoint === "string" &&
+                                endpoint.length > 0,
+                        )
+                      : [],
+                  supportsVision: item.capabilities?.supports?.vision === true,
+              }))
+        : []
+
+    gitHubCopilotModelsCache.set(cacheKey, {
+        expiresAt: Date.now() + COPILOT_MODELS_CACHE_TTL_MS,
+        models,
+    })
+
+    return models
+}
+
+export async function getGitHubCopilotModelMetadataById(input: {
+    token: string
+    modelId: string
+    enterpriseUrl?: string
+    fetchImpl?: typeof fetch
+}): Promise<GitHubCopilotModelMetadata | null> {
+    const models = await fetchGitHubCopilotModelMetadata(input)
+    return models.find((model) => model.modelId === input.modelId) || null
+}
+
+export function isGitHubCopilotResponsesNotFoundError(error: unknown): boolean {
+    const errorObject = error as {
+        url?: string
+        statusCode?: number
+        responseBody?: string
+        cause?: {
+            url?: string
+            statusCode?: number
+            responseBody?: string
+        }
+    }
+
+    const url = errorObject?.url || errorObject?.cause?.url || ""
+    const statusCode =
+        errorObject?.statusCode || errorObject?.cause?.statusCode || undefined
+    const responseBody =
+        errorObject?.responseBody || errorObject?.cause?.responseBody || ""
+
+    if (statusCode !== 404 || !url.includes("/responses") || !responseBody) {
+        return false
+    }
+
+    try {
+        const parsed = JSON.parse(responseBody) as {
+            error?: {
+                code?: string
+            }
+        }
+
+        return parsed?.error?.code === "not_found"
+    } catch {
+        return responseBody.toLowerCase().includes("not_found")
     }
 }
 

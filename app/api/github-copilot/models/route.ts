@@ -6,6 +6,9 @@ import {
     createGitHubCopilotFetch,
     getGitHubCopilotApiBaseUrl,
     getGitHubCopilotAuthSession,
+    getGitHubCopilotModelMetadataById,
+    isGitHubCopilotResponsesNotFoundError,
+    isGitHubCopilotResponsesOnlyModel,
 } from "@/lib/github-copilot"
 import {
     GITHUB_COPILOT_MODEL_CANDIDATES,
@@ -102,13 +105,23 @@ async function validateGitHubCopilotModel(
     enterpriseUrl?: string,
 ): Promise<GitHubCopilotDiscoveredModel> {
     try {
+        const copilotModelMetadata = await getGitHubCopilotModelMetadataById({
+            token: accessToken,
+            modelId,
+            enterpriseUrl,
+        }).catch(() => null)
+
         const provider = createOpenAI({
             apiKey: accessToken,
             baseURL: baseUrl,
             fetch: createGitHubCopilotFetch({ token: accessToken }),
         })
 
-        const model = shouldUseGitHubCopilotResponsesApi(modelId)
+        const model = (
+            copilotModelMetadata
+                ? isGitHubCopilotResponsesOnlyModel(copilotModelMetadata)
+                : shouldUseGitHubCopilotResponsesApi(modelId)
+        )
             ? provider.responses(modelId)
             : provider.chat(modelId)
 
@@ -122,7 +135,10 @@ async function validateGitHubCopilotModel(
     } catch (error) {
         const failure = extractDiscoveryFailure(error)
 
-        if (failure.errorType === "invalid-json") {
+        if (
+            failure.errorType === "invalid-json" ||
+            isGitHubCopilotResponsesNotFoundError(error)
+        ) {
             const fallback = await probeGitHubCopilotChatCompletions({
                 accessToken,
                 modelId,

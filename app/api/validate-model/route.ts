@@ -17,6 +17,9 @@ import {
     createGitHubCopilotFetch,
     getGitHubCopilotApiBaseUrl,
     getGitHubCopilotAuthSession,
+    getGitHubCopilotModelMetadataById,
+    isGitHubCopilotResponsesNotFoundError,
+    isGitHubCopilotResponsesOnlyModel,
 } from "@/lib/github-copilot"
 import { probeGitHubCopilotChatCompletions } from "@/lib/github-copilot-probe"
 import { allowPrivateUrls, isPrivateUrl } from "@/lib/ssrf-protection"
@@ -195,9 +198,36 @@ export async function POST(req: Request) {
                     }),
                 })
 
-                model = shouldUseGitHubCopilotResponsesApi(modelId)
-                    ? copilot.responses(modelId)
-                    : copilot.chat(modelId)
+                const copilotModelMetadata =
+                    await getGitHubCopilotModelMetadataById({
+                        token: copilotAuth.accessToken,
+                        modelId,
+                        enterpriseUrl: copilotAuth.enterpriseUrl,
+                    }).catch(() => null)
+
+                if (
+                    copilotModelMetadata
+                        ? isGitHubCopilotResponsesOnlyModel(
+                              copilotModelMetadata,
+                          )
+                        : shouldUseGitHubCopilotResponsesApi(modelId)
+                ) {
+                    try {
+                        await generateText({
+                            model: copilot.responses(modelId),
+                            prompt: "Reply with exactly OK.",
+                            maxOutputTokens: 16,
+                        })
+
+                        return NextResponse.json({ valid: true })
+                    } catch (error) {
+                        if (!isGitHubCopilotResponsesNotFoundError(error)) {
+                            throw error
+                        }
+                    }
+                }
+
+                model = copilot.chat(modelId)
                 break
             }
 

@@ -35,6 +35,9 @@ import {
     buildGitHubCopilotHeaders,
     getGitHubCopilotApiBaseUrl,
     getGitHubCopilotAuthSession,
+    getGitHubCopilotModelMetadataById,
+    isGitHubCopilotResponsesNotFoundError,
+    isGitHubCopilotResponsesOnlyModel,
 } from "@/lib/github-copilot"
 import {
     getTelemetryConfig,
@@ -150,6 +153,22 @@ function wrapModelWithNormalizedTextStream(model: any): any {
                     stream: normalizeLanguageModelTextPartOrder(result.stream),
                 }
             },
+        },
+    })
+}
+
+function buildUIMessageStream(result: any) {
+    return result.toUIMessageStream({
+        sendReasoning: true,
+        messageMetadata: ({ part }: { part: any }) => {
+            if (part.type === "finish") {
+                const usage = (part as any).totalUsage
+                return {
+                    totalTokens: usage?.totalTokens ?? 0,
+                    finishReason: (part as any).finishReason,
+                }
+            }
+            return undefined
         },
     })
 }
@@ -457,9 +476,28 @@ async function handleChatRequest(req: Request): Promise<Response> {
     const pdfAttachmentCount = lastUserFileParts.filter(
         (part: any) => part?.mediaType === "application/pdf",
     ).length
+    const copilotModelMetadata =
+        requestedProvider === "githubcopilot" &&
+        copilotAuth?.accessToken &&
+        requestedModelId
+            ? await getGitHubCopilotModelMetadataById({
+                  token: copilotAuth.accessToken,
+                  modelId: requestedModelId,
+                  enterpriseUrl: copilotAuth.enterpriseUrl,
+              }).catch((error) => {
+                  console.warn(
+                      `[GitHub Copilot] failed to fetch model metadata for ${requestedModelId}`,
+                      error,
+                  )
+                  return null
+              })
+            : null
     const shouldUseCopilotResponsesApi =
         requestedProvider === "githubcopilot" &&
-        shouldUseGitHubCopilotResponsesApi(requestedModelId)
+        !hasImageInput &&
+        (copilotModelMetadata
+            ? isGitHubCopilotResponsesOnlyModel(copilotModelMetadata)
+            : shouldUseGitHubCopilotResponsesApi(requestedModelId))
 
     // Update Langfuse trace with input, session, and user
     setTraceInput({
@@ -570,7 +608,7 @@ async function handleChatRequest(req: Request): Promise<Response> {
             provider === "githubcopilot"
                 ? copilotAuth?.accessToken
                 : req.headers.get("x-ai-api-key"),
-        modelId: req.headers.get("x-ai-model"),
+        modelId: requestedModelId,
         // AWS Bedrock credentials
         awsAccessKeyId: req.headers.get("x-aws-access-key-id"),
         awsSecretAccessKey: req.headers.get("x-aws-secret-access-key"),
@@ -599,7 +637,7 @@ async function handleChatRequest(req: Request): Promise<Response> {
 
     if (provider === "githubcopilot" && lastUserFileParts.length > 0) {
         console.log(
-            `[GitHub Copilot] attachments detected: total=${lastUserFileParts.length}, images=${imageAttachmentCount}, pdfs=${pdfAttachmentCount}, mode=${shouldUseCopilotResponsesApi ? "responses" : "chat"}`,
+            `[GitHub Copilot] attachments detected: total=${lastUserFileParts.length}, images=${imageAttachmentCount}, pdfs=${pdfAttachmentCount}, mode=${shouldUseCopilotResponsesApi ? "responses" : "chat"}, supportedEndpoints=${copilotModelMetadata?.supportedEndpoints.join(",") || "unknown"}`,
         )
     }
 
@@ -638,6 +676,32 @@ async function handleChatRequest(req: Request): Promise<Response> {
         return Response.json(
             {
                 error: `The model "${modelId}" does not support image input. Please use a vision-capable model (e.g., GPT-4o, Claude, Gemini) or remove the image.`,
+            },
+            { status: 400 },
+        )
+    }
+
+    if (
+        resolvedProvider === "githubcopilot" &&
+        hasImageInput &&
+        copilotModelMetadata?.supportsVision === false
+    ) {
+        return Response.json(
+            {
+                error: `The GitHub Copilot model "${modelId}" does not advertise vision support for this account. Choose a Copilot model that supports images or switch providers.`,
+            },
+            { status: 400 },
+        )
+    }
+
+    if (
+        resolvedProvider === "githubcopilot" &&
+        hasImageInput &&
+        isGitHubCopilotResponsesOnlyModel(copilotModelMetadata)
+    ) {
+        return Response.json(
+            {
+                error: `The GitHub Copilot model "${modelId}" is currently exposed as a /responses-only model for this account. Popular Copilot clients route these models from /models metadata instead of silently downgrading them. For image input, choose a Copilot model that also exposes /chat/completions support, such as gpt-4o, or use another vision-capable provider.`,
             },
             { status: 400 },
         )
@@ -938,120 +1002,128 @@ IMPORTANT: The "Current diagram XML" is the SINGLE SOURCE OF TRUTH for what's on
     const allMessages = [...systemMessages, ...enhancedMessages]
     const maxStepCount = hasImageInput ? 10 : 5
 
-    const result = streamText({
-        model:
-            resolvedProvider === "githubcopilot" &&
-            shouldUseGitHubCopilotResponsesApi(modelId)
-                ? wrapModelWithNormalizedTextStream(model)
-                : model,
-        abortSignal: req.signal,
-        ...(process.env.MAX_OUTPUT_TOKENS && {
-            maxOutputTokens: parseInt(process.env.MAX_OUTPUT_TOKENS, 10),
-        }),
-        stopWhen: stepCountIs(maxStepCount),
-        // Repair truncated tool calls when maxOutputTokens is reached mid-JSON
-        experimental_repairToolCall: async ({ toolCall, error }) => {
-            // DEBUG: Log what we're trying to repair
-            console.log(`[repairToolCall] Tool: ${toolCall.toolName}`)
-            console.log(
-                `[repairToolCall] Error: ${error.name} - ${error.message}`,
-            )
-            console.log(`[repairToolCall] Input type: ${typeof toolCall.input}`)
-            console.log(`[repairToolCall] Input value:`, toolCall.input)
+    const useCopilotResponses =
+        resolvedProvider === "githubcopilot" && shouldUseCopilotResponsesApi
 
-            // Only attempt repair for invalid tool input (broken JSON from truncation)
-            if (
-                error instanceof InvalidToolInputError ||
-                error.name === "AI_InvalidToolInputError"
-            ) {
-                try {
-                    // Pre-process to fix common LLM JSON errors that jsonrepair can't handle
-                    let inputToRepair = toolCall.input
-                    if (typeof inputToRepair === "string") {
-                        // Fix `:=` instead of `: ` (LLM sometimes generates this)
-                        inputToRepair = inputToRepair.replace(/:=/g, ": ")
-                        // Fix `= "` instead of `: "`
-                        inputToRepair = inputToRepair.replace(/=\s*"/g, ': "')
-                        // Fix inconsistent quote escaping in XML attributes within JSON strings
-                        // Pattern: attribute="value\" where opening quote is unescaped but closing is escaped
-                        // Example: y="-20\" should be y=\"-20\"
-                        inputToRepair = inputToRepair.replace(
-                            /(\w+)="([^"]*?)\\"/g,
-                            '$1=\\"$2\\"',
-                        )
-                    }
-                    // Use jsonrepair to fix truncated JSON
-                    const repairedInput = jsonrepair(inputToRepair)
-                    console.log(
-                        `[repairToolCall] Repaired truncated JSON for tool: ${toolCall.toolName}`,
-                    )
-                    return { ...toolCall, input: repairedInput }
-                } catch (repairError) {
-                    console.warn(
-                        `[repairToolCall] Failed to repair JSON for tool: ${toolCall.toolName}`,
-                        repairError,
-                    )
-                    // Return a placeholder input to avoid API errors in multi-step
-                    // The tool will fail gracefully on client side
-                    if (toolCall.toolName === "edit_diagram") {
-                        return {
-                            ...toolCall,
-                            input: {
-                                operations: [],
-                                _error: "JSON repair failed - no operations to apply",
-                            },
-                        }
-                    }
-                    if (toolCall.toolName === "display_diagram") {
-                        return {
-                            ...toolCall,
-                            input: {
-                                xml: "",
-                                _error: "JSON repair failed - empty diagram",
-                            },
-                        }
-                    }
-                    return null
-                }
-            }
-            // Don't attempt to repair other errors (like NoSuchToolError)
-            return null
-        },
-        messages: allMessages,
-        ...(providerOptions && { providerOptions }), // This now includes all reasoning configs
-        ...(headers && { headers }),
-        // Langfuse telemetry config (returns undefined if not configured)
-        ...(getTelemetryConfig({ sessionId: validSessionId, userId }) && {
-            experimental_telemetry: getTelemetryConfig({
-                sessionId: validSessionId,
-                userId,
+    const createResult = (
+        activeModel: any,
+        activeHeaders?: Record<string, string>,
+    ) =>
+        streamText({
+            model: activeModel,
+            abortSignal: req.signal,
+            ...(process.env.MAX_OUTPUT_TOKENS && {
+                maxOutputTokens: parseInt(process.env.MAX_OUTPUT_TOKENS, 10),
             }),
-        }),
-        onFinish: ({ text, totalUsage }) => {
-            // AI SDK 6 telemetry auto-reports token usage on its spans
-            setTraceOutput(text)
+            stopWhen: stepCountIs(maxStepCount),
+            // Repair truncated tool calls when maxOutputTokens is reached mid-JSON
+            experimental_repairToolCall: async ({ toolCall, error }) => {
+                // DEBUG: Log what we're trying to repair
+                console.log(`[repairToolCall] Tool: ${toolCall.toolName}`)
+                console.log(
+                    `[repairToolCall] Error: ${error.name} - ${error.message}`,
+                )
+                console.log(
+                    `[repairToolCall] Input type: ${typeof toolCall.input}`,
+                )
+                console.log(`[repairToolCall] Input value:`, toolCall.input)
 
-            // Record token usage for server-side quota tracking (if enabled)
-            // Use totalUsage (cumulative across all steps) instead of usage (final step only)
-            // Include all 4 token types: input, output, cache read, cache write
-            if (
-                isQuotaEnabled() &&
-                !hasOwnApiKey &&
-                userId !== "anonymous" &&
-                totalUsage
-            ) {
-                const totalTokens =
-                    (totalUsage.inputTokens || 0) +
-                    (totalUsage.outputTokens || 0) +
-                    (totalUsage.cachedInputTokens || 0) +
-                    (totalUsage.inputTokenDetails?.cacheWriteTokens || 0)
-                recordTokenUsage(userId, totalTokens)
-            }
-        },
-        tools: {
-            // Client-side tool that will be executed on the client
-            display_diagram: {
-                description: `Display a diagram on draw.io. Pass ONLY the mxCell elements - wrapper tags and root cells are added automatically.
+                // Only attempt repair for invalid tool input (broken JSON from truncation)
+                if (
+                    error instanceof InvalidToolInputError ||
+                    error.name === "AI_InvalidToolInputError"
+                ) {
+                    try {
+                        // Pre-process to fix common LLM JSON errors that jsonrepair can't handle
+                        let inputToRepair = toolCall.input
+                        if (typeof inputToRepair === "string") {
+                            // Fix `:=` instead of `: ` (LLM sometimes generates this)
+                            inputToRepair = inputToRepair.replace(/:=/g, ": ")
+                            // Fix `= "` instead of `: "`
+                            inputToRepair = inputToRepair.replace(
+                                /=\s*"/g,
+                                ': "',
+                            )
+                            // Fix inconsistent quote escaping in XML attributes within JSON strings
+                            // Pattern: attribute="value\" where opening quote is unescaped but closing is escaped
+                            // Example: y="-20\" should be y=\"-20\"
+                            inputToRepair = inputToRepair.replace(
+                                /(\w+)="([^"]*?)\\"/g,
+                                '$1=\\"$2\\"',
+                            )
+                        }
+                        // Use jsonrepair to fix truncated JSON
+                        const repairedInput = jsonrepair(inputToRepair)
+                        console.log(
+                            `[repairToolCall] Repaired truncated JSON for tool: ${toolCall.toolName}`,
+                        )
+                        return { ...toolCall, input: repairedInput }
+                    } catch (repairError) {
+                        console.warn(
+                            `[repairToolCall] Failed to repair JSON for tool: ${toolCall.toolName}`,
+                            repairError,
+                        )
+                        // Return a placeholder input to avoid API errors in multi-step
+                        // The tool will fail gracefully on client side
+                        if (toolCall.toolName === "edit_diagram") {
+                            return {
+                                ...toolCall,
+                                input: {
+                                    operations: [],
+                                    _error: "JSON repair failed - no operations to apply",
+                                },
+                            }
+                        }
+                        if (toolCall.toolName === "display_diagram") {
+                            return {
+                                ...toolCall,
+                                input: {
+                                    xml: "",
+                                    _error: "JSON repair failed - empty diagram",
+                                },
+                            }
+                        }
+                        return null
+                    }
+                }
+                // Don't attempt to repair other errors (like NoSuchToolError)
+                return null
+            },
+            messages: allMessages,
+            ...(providerOptions && { providerOptions }), // This now includes all reasoning configs
+            ...(activeHeaders && { headers: activeHeaders }),
+            // Langfuse telemetry config (returns undefined if not configured)
+            ...(getTelemetryConfig({ sessionId: validSessionId, userId }) && {
+                experimental_telemetry: getTelemetryConfig({
+                    sessionId: validSessionId,
+                    userId,
+                }),
+            }),
+            onFinish: ({ text, totalUsage }) => {
+                // AI SDK 6 telemetry auto-reports token usage on its spans
+                setTraceOutput(text)
+
+                // Record token usage for server-side quota tracking (if enabled)
+                // Use totalUsage (cumulative across all steps) instead of usage (final step only)
+                // Include all 4 token types: input, output, cache read, cache write
+                if (
+                    isQuotaEnabled() &&
+                    !hasOwnApiKey &&
+                    userId !== "anonymous" &&
+                    totalUsage
+                ) {
+                    const totalTokens =
+                        (totalUsage.inputTokens || 0) +
+                        (totalUsage.outputTokens || 0) +
+                        (totalUsage.cachedInputTokens || 0) +
+                        (totalUsage.inputTokenDetails?.cacheWriteTokens || 0)
+                    recordTokenUsage(userId, totalTokens)
+                }
+            },
+            tools: {
+                // Client-side tool that will be executed on the client
+                display_diagram: {
+                    description: `Display a diagram on draw.io. Pass ONLY the mxCell elements - wrapper tags and root cells are added automatically.
 
 VALIDATION RULES (XML will be rejected if violated):
 1. Generate ONLY mxCell elements - NO wrapper tags (<mxfile>, <mxGraphModel>, <root>)
@@ -1082,14 +1154,14 @@ Notes:
 - For AWS diagrams, use **AWS 2025 icons**.
 - For animated connectors, add "flowAnimation=1" to edge style.
 `,
-                inputSchema: z.object({
-                    xml: z
-                        .string()
-                        .describe("XML string to be displayed on draw.io"),
-                }),
-            },
-            edit_diagram: {
-                description: `Edit the current diagram by ID-based operations (update/add/delete cells).
+                    inputSchema: z.object({
+                        xml: z
+                            .string()
+                            .describe("XML string to be displayed on draw.io"),
+                    }),
+                },
+                edit_diagram: {
+                    description: `Edit the current diagram by ID-based operations (update/add/delete cells).
 
 Operations:
 - update: Replace an existing cell by its id. Provide cell_id and complete new_xml.
@@ -1105,33 +1177,33 @@ Example - Add a rectangle:
 
 Example - Delete container (children & edges auto-deleted):
 {"operations": [{"operation": "delete", "cell_id": "2"}]}`,
-                inputSchema: z.object({
-                    operations: z
-                        .array(
-                            z.object({
-                                operation: z
-                                    .enum(["update", "add", "delete"])
-                                    .describe(
-                                        "Operation to perform: add, update, or delete",
-                                    ),
-                                cell_id: z
-                                    .string()
-                                    .describe(
-                                        "The id of the mxCell. Must match the id attribute in new_xml.",
-                                    ),
-                                new_xml: z
-                                    .string()
-                                    .optional()
-                                    .describe(
-                                        "Complete mxCell XML element (required for update/add)",
-                                    ),
-                            }),
-                        )
-                        .describe("Array of operations to apply"),
-                }),
-            },
-            append_diagram: {
-                description: `Continue generating diagram XML when previous display_diagram output was truncated due to length limits.
+                    inputSchema: z.object({
+                        operations: z
+                            .array(
+                                z.object({
+                                    operation: z
+                                        .enum(["update", "add", "delete"])
+                                        .describe(
+                                            "Operation to perform: add, update, or delete",
+                                        ),
+                                    cell_id: z
+                                        .string()
+                                        .describe(
+                                            "The id of the mxCell. Must match the id attribute in new_xml.",
+                                        ),
+                                    new_xml: z
+                                        .string()
+                                        .optional()
+                                        .describe(
+                                            "Complete mxCell XML element (required for update/add)",
+                                        ),
+                                }),
+                            )
+                            .describe("Array of operations to apply"),
+                    }),
+                },
+                append_diagram: {
+                    description: `Continue generating diagram XML when previous display_diagram output was truncated due to length limits.
 
 WHEN TO USE: Only call this tool after display_diagram was truncated (you'll see an error message about truncation).
 
@@ -1142,16 +1214,16 @@ CRITICAL INSTRUCTIONS:
 4. If still truncated, call append_diagram again with the next fragment
 
 Example: If previous output ended with '<mxCell id="x" style="rounded=1', continue with ';" vertex="1">...' and complete the remaining elements.`,
-                inputSchema: z.object({
-                    xml: z
-                        .string()
-                        .describe(
-                            "Continuation XML fragment to append (NO wrapper tags)",
-                        ),
-                }),
-            },
-            get_shape_library: {
-                description: `Get draw.io shape/icon library documentation with style syntax and shape names.
+                    inputSchema: z.object({
+                        xml: z
+                            .string()
+                            .describe(
+                                "Continuation XML fragment to append (NO wrapper tags)",
+                            ),
+                    }),
+                },
+                get_shape_library: {
+                    description: `Get draw.io shape/icon library documentation with style syntax and shape names.
 
 Available libraries:
 - Cloud: aws4, azure2, gcp2, alibaba_cloud, openstack, salesforce
@@ -1165,88 +1237,130 @@ Available libraries:
 
 Call this tool to get shape names and usage syntax for a specific library.
 For large libraries such as aws4, azure2, or webicons, first call without query to get a compact overview, then call again with query to find exact shapes.`,
-                inputSchema: z.object({
-                    library: z
-                        .string()
-                        .describe(
-                            "Library name (e.g., 'aws4', 'kubernetes', 'flowchart')",
-                        ),
-                    query: z
-                        .string()
-                        .optional()
-                        .describe(
-                            "Optional keywords to find relevant shapes within large libraries (e.g., 'openai kubernetes gateway')",
-                        ),
-                }),
-                execute: async ({ library, query }) => {
-                    // Sanitize input - prevent path traversal attacks
-                    const sanitizedLibrary = library
-                        .toLowerCase()
-                        .replace(/[^a-z0-9_-]/g, "")
+                    inputSchema: z.object({
+                        library: z
+                            .string()
+                            .describe(
+                                "Library name (e.g., 'aws4', 'kubernetes', 'flowchart')",
+                            ),
+                        query: z
+                            .string()
+                            .optional()
+                            .describe(
+                                "Optional keywords to find relevant shapes within large libraries (e.g., 'openai kubernetes gateway')",
+                            ),
+                    }),
+                    execute: async ({ library, query }) => {
+                        // Sanitize input - prevent path traversal attacks
+                        const sanitizedLibrary = library
+                            .toLowerCase()
+                            .replace(/[^a-z0-9_-]/g, "")
 
-                    if (sanitizedLibrary !== library.toLowerCase()) {
-                        return `Invalid library name "${library}". Use only letters, numbers, underscores, and hyphens.`
-                    }
-
-                    const baseDir = path.join(
-                        process.cwd(),
-                        "docs/shape-libraries",
-                    )
-                    const filePath = path.join(
-                        baseDir,
-                        `${sanitizedLibrary}.md`,
-                    )
-
-                    // Verify path stays within expected directory
-                    const resolvedPath = path.resolve(filePath)
-                    if (!resolvedPath.startsWith(path.resolve(baseDir))) {
-                        return `Invalid library path.`
-                    }
-
-                    try {
-                        const content = await fs.readFile(filePath, "utf-8")
-                        return formatShapeLibraryResponse({
-                            library: sanitizedLibrary,
-                            content,
-                            query,
-                        })
-                    } catch (error) {
-                        if (
-                            (error as NodeJS.ErrnoException).code === "ENOENT"
-                        ) {
-                            return `Library "${library}" not found. Available: aws4, azure2, gcp2, alibaba_cloud, cisco19, kubernetes, network, bpmn, flowchart, basic, arrows2, vvd, salesforce, citrix, sap, mscae, atlassian, fluidpower, electrical, pid, cabinets, floorplan, webicons, infographic, sitemap, android, material_design, lean_mapping, openstack, rack`
+                        if (sanitizedLibrary !== library.toLowerCase()) {
+                            return `Invalid library name "${library}". Use only letters, numbers, underscores, and hyphens.`
                         }
-                        console.error(
-                            `[get_shape_library] Error loading "${library}":`,
-                            error,
+
+                        const baseDir = path.join(
+                            process.cwd(),
+                            "docs/shape-libraries",
                         )
-                        return `Error loading library "${library}". Please try again.`
-                    }
+                        const filePath = path.join(
+                            baseDir,
+                            `${sanitizedLibrary}.md`,
+                        )
+
+                        // Verify path stays within expected directory
+                        const resolvedPath = path.resolve(filePath)
+                        if (!resolvedPath.startsWith(path.resolve(baseDir))) {
+                            return `Invalid library path.`
+                        }
+
+                        try {
+                            const content = await fs.readFile(filePath, "utf-8")
+                            return formatShapeLibraryResponse({
+                                library: sanitizedLibrary,
+                                content,
+                                query,
+                            })
+                        } catch (error) {
+                            if (
+                                (error as NodeJS.ErrnoException).code ===
+                                "ENOENT"
+                            ) {
+                                return `Library "${library}" not found. Available: aws4, azure2, gcp2, alibaba_cloud, cisco19, kubernetes, network, bpmn, flowchart, basic, arrows2, vvd, salesforce, citrix, sap, mscae, atlassian, fluidpower, electrical, pid, cabinets, floorplan, webicons, infographic, sitemap, android, material_design, lean_mapping, openstack, rack`
+                            }
+                            console.error(
+                                `[get_shape_library] Error loading "${library}":`,
+                                error,
+                            )
+                            return `Error loading library "${library}". Please try again.`
+                        }
+                    },
                 },
             },
-        },
-        ...(process.env.TEMPERATURE !== undefined && {
-            temperature: parseFloat(process.env.TEMPERATURE),
-        }),
-    })
+            ...(process.env.TEMPERATURE !== undefined && {
+                temperature: parseFloat(process.env.TEMPERATURE),
+            }),
+        })
 
-    const uiMessageStream = result.toUIMessageStream({
-        sendReasoning: true,
-        messageMetadata: ({ part }) => {
-            if (part.type === "finish") {
-                const usage = (part as any).totalUsage
-                // AI SDK 6 provides totalTokens directly
-                return {
-                    totalTokens: usage?.totalTokens ?? 0,
-                    finishReason: (part as any).finishReason,
+    const result = createResult(
+        useCopilotResponses ? wrapModelWithNormalizedTextStream(model) : model,
+        headers,
+    )
+
+    if (!useCopilotResponses) {
+        return createUIMessageStreamResponse({
+            stream: normalizeUIMessageChunkOrder(buildUIMessageStream(result)),
+        })
+    }
+
+    const stream = createUIMessageStream({
+        execute: async ({ writer }) => {
+            const forwardResult = async (activeResult: any) => {
+                const reader = buildUIMessageStream(activeResult).getReader()
+
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read()
+                        if (done) {
+                            break
+                        }
+                        writer.write(value)
+                    }
+                } finally {
+                    reader.releaseLock()
                 }
             }
-            return undefined
+
+            try {
+                await forwardResult(result)
+            } catch (error) {
+                if (!isGitHubCopilotResponsesNotFoundError(error)) {
+                    throw error
+                }
+
+                console.warn(
+                    `[GitHub Copilot] /responses returned 404 for model ${modelId}; retrying with /chat/completions`,
+                )
+
+                const { model: fallbackModel, headers: fallbackHeaders } =
+                    getAIModel({
+                        ...clientOverrides,
+                        preferResponses: false,
+                    })
+
+                const fallbackResult = createResult(
+                    fallbackModel,
+                    fallbackHeaders,
+                )
+
+                await forwardResult(fallbackResult)
+            }
         },
     })
 
     return createUIMessageStreamResponse({
-        stream: normalizeUIMessageChunkOrder(uiMessageStream),
+        stream: normalizeUIMessageChunkOrder(stream),
     })
 }
 
