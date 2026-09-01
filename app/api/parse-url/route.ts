@@ -1,4 +1,4 @@
-import { extract } from "@extractus/article-extractor"
+import { extractFromHtml } from "@extractus/article-extractor"
 import { NextResponse } from "next/server"
 import TurndownService from "turndown"
 import { isPrivateUrl } from "@/lib/ssrf-protection"
@@ -6,6 +6,31 @@ import { isPrivateUrl } from "@/lib/ssrf-protection"
 const MAX_CONTENT_LENGTH = 150000 // Match PDF limit
 const EXTRACT_TIMEOUT_MS = 15000
 const USER_AGENT = "Mozilla/5.0 (compatible; NextAIDrawio/1.0)"
+
+// Detect the page's charset so non-UTF-8 pages (Shift_JIS/GBK/EUC/Big5, common
+// on CJK sites) are decoded correctly. Response.text() always assumes UTF-8 and
+// would produce mojibake; the article-extractor library does the same detection
+// when it fetches the page itself, which we no longer rely on.
+function detectCharset(
+    contentType: string | null,
+    buffer: ArrayBuffer,
+): string {
+    // 1. HTTP Content-Type header charset (most authoritative).
+    const headerCharset = contentType?.match(/charset=([^;]+)/i)?.[1]?.trim()
+    // 2. <meta charset> / <meta http-equiv> in the first bytes of the document.
+    const head = new TextDecoder("utf-8").decode(buffer.slice(0, 4096))
+    const metaCharset =
+        head.match(/<meta[^>]+charset=["']?\s*([\w-]+)/i)?.[1] ||
+        head.match(/<meta[^>]+content=["'][^"']*charset=([\w-]+)/i)?.[1]
+    const charset = (headerCharset || metaCharset || "utf-8").toLowerCase()
+    // TextDecoder throws on unknown encoding labels; fall back to UTF-8.
+    try {
+        new TextDecoder(charset)
+        return charset
+    } catch {
+        return "utf-8"
+    }
+}
 
 export async function POST(req: Request) {
     try {
@@ -31,21 +56,31 @@ export async function POST(req: Request) {
         // SSRF protection: parse-url has no use case for fetching internal
         // hosts, so private URLs are always rejected. ALLOW_PRIVATE_URLS only
         // governs LLM provider baseUrl overrides (validate-model, chat).
-        if (isPrivateUrl(url)) {
+        if (await isPrivateUrl(url)) {
             return NextResponse.json(
                 { error: "Cannot access private/internal URLs" },
                 { status: 400 },
             )
         }
-        const headController = new AbortController()
-        const headTimeout = setTimeout(() => headController.abort(), 3000)
+        // Fetch the page ourselves so we control redirect handling. The
+        // article-extractor library follows redirects internally and ignores a
+        // `redirect` option, which would let a public URL 302 to an internal
+        // host and bypass the SSRF check above. `redirect: "error"` rejects any
+        // redirect outright.
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => {
+            controller.abort()
+        }, EXTRACT_TIMEOUT_MS)
+
+        let html: string
         try {
-            const headResponse = await fetch(url, {
-                method: "HEAD",
+            const response = await fetch(url, {
                 headers: { "User-Agent": USER_AGENT },
-                signal: headController.signal,
+                redirect: "error",
+                signal: controller.signal,
             })
-            const contentType = headResponse.headers.get("content-type")
+
+            const contentType = response.headers.get("content-type")
             if (contentType?.includes("application/pdf")) {
                 return NextResponse.json(
                     {
@@ -54,27 +89,17 @@ export async function POST(req: Request) {
                     { status: 422 },
                 )
             }
-        } catch (err) {
-            console.warn(
-                "HEAD pre-check failed, proceeding with extraction:",
-                err,
-            )
-        } finally {
-            clearTimeout(headTimeout)
-        }
 
-        // Extract article content with timeout to avoid tying up server resources
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => {
-            controller.abort()
-        }, EXTRACT_TIMEOUT_MS)
+            if (!response.ok) {
+                return NextResponse.json(
+                    { error: "Could not fetch URL content" },
+                    { status: 400 },
+                )
+            }
 
-        let article
-        try {
-            article = await extract(url, undefined, {
-                headers: { "User-Agent": USER_AGENT },
-                signal: controller.signal,
-            })
+            const buffer = await response.arrayBuffer()
+            const charset = detectCharset(contentType, buffer)
+            html = new TextDecoder(charset).decode(buffer)
         } catch (err: any) {
             if (err?.name === "AbortError") {
                 return NextResponse.json(
@@ -82,9 +107,23 @@ export async function POST(req: Request) {
                     { status: 504 },
                 )
             }
-            throw err
+            // Redirects are rejected with a TypeError ("failed to fetch" /
+            // "unexpected redirect") when redirect: "error" is set.
+            return NextResponse.json(
+                { error: "Could not fetch URL content" },
+                { status: 400 },
+            )
         } finally {
             clearTimeout(timeoutId)
+        }
+
+        // extractFromHtml throws (not returns null) on empty/non-HTML bodies,
+        // so map any parse error to the same 400 as the no-content case.
+        let article: Awaited<ReturnType<typeof extractFromHtml>>
+        try {
+            article = await extractFromHtml(html, url)
+        } catch {
+            article = null
         }
 
         if (!article || !article.content) {

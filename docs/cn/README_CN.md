@@ -204,6 +204,7 @@ npm run dev
 -   Azure OpenAI
 -   Ollama
 -   OpenRouter
+-   AIHubMix
 -   DeepSeek
 -   SiliconFlow
 -   ModelScope
@@ -216,11 +217,17 @@ npm run dev
 
 ### 服务端多模型配置
 
-管理员可以配置多个服务端模型，让所有用户无需提供个人 API Key 即可使用。通过 `AI_MODELS_CONFIG` 环境变量（JSON 字符串）或 `ai-models.json` 文件配置。
+管理员可以配置多个服务端模型，让所有用户无需提供个人 API Key 即可使用。通过 `AI_MODELS_CONFIG` 环境变量（JSON 字符串）或 `ai-models.json` 文件配置。如果只需要单 provider 下的多个模型，也可以直接在 `AI_MODEL` 中用逗号分隔模型 ID。
 
 **模型要求**：此任务需要强大的模型能力，因为它涉及生成具有严格格式约束的长文本（draw.io XML）。推荐使用 Claude Sonnet 4.5、GPT-5.1、Gemini 3 Pro 和 DeepSeek V3.2/R1。
 
 注意：`claude` 系列已在带有 AWS、Azure、GCP 等云架构 Logo 的 draw.io 图表上进行训练，因此如果您想创建云架构图，这是最佳选择。
+
+### 管理面板
+
+设置 `ADMIN_PASSWORD` 环境变量并访问 `/admin`，即可在 Web 面板中管理服务端设置（模型、访问码、功能开关、可观测性、配额），无需手动编辑 `.env`。
+
+📖 **[管理面板指南](./admin-panel.md)** — 启用方法、优先级规则和注意事项。
 
 
 ## 工作原理

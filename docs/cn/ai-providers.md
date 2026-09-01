@@ -46,6 +46,21 @@ AI_MODEL=gpt-4o
 OPENAI_BASE_URL=https://your-custom-endpoint/v1
 ```
 
+### AIHubMix
+
+AIHubMix 通过单个 API Key 聚合 Claude、GPT、Gemini、DeepSeek 等模型。
+
+```bash
+AIHUBMIX_API_KEY=your_api_key
+AI_MODEL=claude-sonnet-4-5-20250929
+```
+
+可选的自定义端点：
+
+```bash
+AIHUBMIX_BASE_URL=https://aihubmix.com/v1
+```
+
 ### Anthropic
 
 ```bash
@@ -293,6 +308,19 @@ AI_MODEL=your_model_id
 QINIU_BASE_URL=https://your-custom-endpoint
 ```
 
+### MiMo (小米)
+
+```bash
+MIMO_API_KEY=your_api_key
+AI_MODEL=mimo-v2.5-pro
+```
+
+可选的自定义端点（Token Plan 订阅用户请设置专属 Base URL）：
+
+```bash
+MIMO_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
+```
+
 ## 自动检测
 
 如果您只配置了**一个**提供商的 API 密钥，系统将自动检测并使用该提供商。无需设置 `AI_PROVIDER`。
@@ -300,7 +328,7 @@ QINIU_BASE_URL=https://your-custom-endpoint
 如果您配置了**多个** API 密钥，则必须显式设置 `AI_PROVIDER`：
 
 ```bash
-AI_PROVIDER=google  # 或：openai, anthropic, deepseek, siliconflow, doubao, azure, bedrock, openrouter, ollama, gateway, sglang, modelscope, minimax, glm, qwen, kimi, qiniu
+AI_PROVIDER=google  # 或：openai, anthropic, aihubmix, deepseek, siliconflow, doubao, azure, bedrock, openrouter, ollama, gateway, sglang, modelscope, minimax, glm, qwen, kimi, qiniu, mimo
 ```
 
 ## 服务端多模型配置
@@ -320,6 +348,17 @@ AI_MODELS_CONFIG='{"providers":[{"name":"OpenAI","provider":"openai","models":["
 **方式二：配置文件**
 
 在项目根目录创建 `ai-models.json` 文件（或通过 `AI_MODELS_CONFIG_PATH` 指定路径）。
+
+**方式三：`AI_MODEL` 用逗号分隔**（单 provider 的快速配置）
+
+如果只需要暴露同一 provider 下的多个模型，可以直接在 `AI_MODEL` 里用逗号分隔。第一个模型会作为默认值。
+
+```bash
+AI_PROVIDER=doubao
+AI_MODEL=doubao-seed-1-8-251215,doubao-seed-1-6-flash,doubao-seed-1-6-pro
+```
+
+这是等价 `ai-models.json` 的简写形式。如果需要配置多个 provider，或自定义 `apiKeyEnv` / `baseUrlEnv`，请使用方式一或方式二。
 
 ### 配置示例
 

@@ -1,10 +1,35 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
     getAIModel,
+    isAihubmixStandardBaseURL,
     resolveBaseURL,
-    supportsImageInput,
     supportsPromptCaching,
 } from "@/lib/ai-providers"
+import { extractAihubmixModelIds } from "@/lib/aihubmix-models"
+
+describe("extractAihubmixModelIds", () => {
+    it("extracts unique chat model IDs from the AIHubMix model list payload", () => {
+        const models = extractAihubmixModelIds({
+            data: [
+                { model_id: "claude-sonnet-4-5-20250929", types: "llm" },
+                { model_id: "gpt-5.1", types: "llm" },
+                { model_id: "gpt-5.1", types: "llm" },
+                { model_id: "gpt-image-2", types: "image_generation,llm" },
+                { model_id: "cohere-rerank-v4.0", types: "rerank" },
+                { model_id: "", types: "llm" },
+                { types: "llm" },
+            ],
+        })
+
+        expect(models).toEqual(["claude-sonnet-4-5-20250929", "gpt-5.1"])
+    })
+
+    it("returns an empty list for malformed payloads", () => {
+        expect(extractAihubmixModelIds({ data: null })).toEqual([])
+        expect(extractAihubmixModelIds({})).toEqual([])
+        expect(extractAihubmixModelIds(null)).toEqual([])
+    })
+})
 
 describe("resolveBaseURL", () => {
     const SERVER_BASE_URL = "https://server-proxy.example.com"
@@ -157,89 +182,6 @@ describe("supportsPromptCaching", () => {
     })
 })
 
-describe("supportsImageInput", () => {
-    it("returns true for models with vision capability", () => {
-        expect(supportsImageInput("gpt-4-vision")).toBe(true)
-        expect(supportsImageInput("qwen-vl")).toBe(true)
-        expect(supportsImageInput("deepseek-vl")).toBe(true)
-    })
-
-    it("returns false for Kimi K2 models without vision", () => {
-        expect(supportsImageInput("kimi-k2")).toBe(false)
-        expect(supportsImageInput("moonshot/kimi-k2")).toBe(false)
-    })
-
-    it("returns true for Kimi K2.5 models (supports vision)", () => {
-        expect(supportsImageInput("kimi-k2.5")).toBe(true)
-        expect(supportsImageInput("moonshotai/kimi-k2.5")).toBe(true)
-    })
-
-    it("returns false for Moonshot v1 text models", () => {
-        expect(supportsImageInput("moonshot-v1-8k")).toBe(false)
-        expect(supportsImageInput("moonshot-v1-32k")).toBe(false)
-        expect(supportsImageInput("moonshot-v1-128k")).toBe(false)
-    })
-
-    it("returns false for MiniMax M2 text models", () => {
-        expect(supportsImageInput("MiniMax-M2.7")).toBe(false)
-        expect(supportsImageInput("MiniMax-M2.7-highspeed")).toBe(false)
-        expect(supportsImageInput("MiniMax-M2")).toBe(false)
-    })
-
-    it("returns true for MiniMax M3 (supports image input)", () => {
-        expect(supportsImageInput("MiniMax-M3")).toBe(true)
-    })
-
-    it("returns false for DeepSeek text models", () => {
-        expect(supportsImageInput("deepseek-chat")).toBe(false)
-        expect(supportsImageInput("deepseek-coder")).toBe(false)
-    })
-
-    it("returns false for Qwen text models", () => {
-        expect(supportsImageInput("qwen-turbo")).toBe(false)
-        expect(supportsImageInput("qwen-plus")).toBe(false)
-        expect(supportsImageInput("qwen3-max")).toBe(false)
-    })
-
-    it("returns true for Qwen vision models", () => {
-        expect(supportsImageInput("qwen-vl")).toBe(true)
-        expect(supportsImageInput("Qwen3.5")).toBe(true)
-        expect(supportsImageInput("qwen3.5")).toBe(true)
-        expect(supportsImageInput("qwen3.5-plus")).toBe(true)
-        expect(supportsImageInput("qwen3.5-flash")).toBe(true)
-        expect(supportsImageInput("qwen3-vl-plus")).toBe(true)
-        expect(supportsImageInput("qwen3-vl-flash")).toBe(true)
-    })
-
-    it("returns true for QvQ (Qwen Visual QA) models including OpenRouter-prefixed names", () => {
-        expect(supportsImageInput("qvq-72b-preview")).toBe(true)
-        expect(supportsImageInput("qvq-max")).toBe(true)
-        expect(supportsImageInput("qwen/qvq-72b-preview")).toBe(true)
-        expect(supportsImageInput("qwen/qvq-max")).toBe(true)
-    })
-
-    it("returns false for GLM text models", () => {
-        expect(supportsImageInput("glm-4")).toBe(false)
-        expect(supportsImageInput("glm-4-plus")).toBe(false)
-        expect(supportsImageInput("glm-4-flash")).toBe(false)
-        expect(supportsImageInput("glm-4-long")).toBe(false)
-        expect(supportsImageInput("glm-4.7")).toBe(false)
-        expect(supportsImageInput("glm-5")).toBe(false)
-    })
-
-    it("returns true for GLM vision models", () => {
-        expect(supportsImageInput("glm-4v")).toBe(true)
-        expect(supportsImageInput("glm-4v-9b")).toBe(true)
-        expect(supportsImageInput("glm-4.1v-9b-thinking")).toBe(true)
-    })
-
-    it("returns true for Claude and GPT models by default", () => {
-        expect(supportsImageInput("claude-sonnet-4-5")).toBe(true)
-        expect(supportsImageInput("gpt-4o")).toBe(true)
-        expect(supportsImageInput("gemini-pro")).toBe(true)
-    })
-})
-
 vi.mock("ollama-ai-provider-v2", () => {
     const mockModel = { modelId: "test-model" }
     const mockProviderFn = vi.fn(() => mockModel)
@@ -254,6 +196,128 @@ vi.mock("@ai-sdk/deepseek", () => {
     const mockCreateDeepSeek = vi.fn(() => mockProviderFn)
     const mockDeepseek = vi.fn(() => mockModel)
     return { createDeepSeek: mockCreateDeepSeek, deepseek: mockDeepseek }
+})
+
+vi.mock("@aihubmix/ai-sdk-provider", () => {
+    const mockModel = { modelId: "test-model" }
+    const mockProviderFn = vi.fn(() => mockModel)
+    const mockCreateAihubmix = vi.fn(() => mockProviderFn)
+    const mockAihubmix = vi.fn(() => mockModel)
+    return { aihubmix: mockAihubmix, createAihubmix: mockCreateAihubmix }
+})
+
+vi.mock("@ai-sdk/openai", () => {
+    const mockModel = { modelId: "test-model" }
+    const mockChat = vi.fn(() => mockModel)
+    const mockProviderFn = vi.fn(() => mockModel) as any
+    mockProviderFn.chat = mockChat
+    const mockCreateOpenAI = vi.fn(() => mockProviderFn)
+    const mockOpenai = vi.fn(() => mockModel)
+    return { createOpenAI: mockCreateOpenAI, openai: mockOpenai }
+})
+
+describe("AIHubMix provider", () => {
+    let createAihubmixMock: ReturnType<typeof vi.fn>
+    const savedEnv: Record<string, string | undefined> = {}
+
+    beforeEach(async () => {
+        savedEnv.AIHUBMIX_API_KEY = process.env.AIHUBMIX_API_KEY
+        savedEnv.AIHUBMIX_BASE_URL = process.env.AIHUBMIX_BASE_URL
+        delete process.env.AIHUBMIX_BASE_URL
+
+        const mod = await import("@aihubmix/ai-sdk-provider")
+        createAihubmixMock = mod.createAihubmix as ReturnType<typeof vi.fn>
+        createAihubmixMock.mockClear()
+    })
+
+    afterEach(() => {
+        process.env.AIHUBMIX_API_KEY = savedEnv.AIHUBMIX_API_KEY
+        process.env.AIHUBMIX_BASE_URL = savedEnv.AIHUBMIX_BASE_URL
+    })
+
+    it("uses AIHUBMIX_API_KEY for server configured AIHubMix", () => {
+        process.env.AIHUBMIX_API_KEY = "server-aihubmix-key"
+
+        getAIModel({
+            provider: "aihubmix",
+            modelId: "claude-sonnet-4-5-20250929",
+        })
+
+        expect(createAihubmixMock).toHaveBeenCalledWith({
+            apiKey: "server-aihubmix-key",
+            appCode: "MSBS9675",
+        })
+    })
+
+    it("uses client BYOK API key for AIHubMix", () => {
+        getAIModel({
+            provider: "aihubmix",
+            apiKey: "client-aihubmix-key",
+            modelId: "gpt-5.1",
+        })
+
+        expect(createAihubmixMock).toHaveBeenCalledWith({
+            apiKey: "client-aihubmix-key",
+            appCode: "MSBS9675",
+        })
+    })
+
+    it("recognizes AIHubMix standard endpoints", () => {
+        expect(isAihubmixStandardBaseURL(undefined)).toBe(true)
+        expect(isAihubmixStandardBaseURL("https://aihubmix.com")).toBe(true)
+        expect(isAihubmixStandardBaseURL("https://aihubmix.com/v1/")).toBe(true)
+        expect(isAihubmixStandardBaseURL("https://proxy.example.com/v1")).toBe(
+            false,
+        )
+    })
+})
+
+describe("Atlas Cloud provider", () => {
+    let createOpenAIMock: ReturnType<typeof vi.fn>
+    const savedEnv: Record<string, string | undefined> = {}
+
+    beforeEach(async () => {
+        savedEnv.ATLASCLOUD_API_KEY = process.env.ATLASCLOUD_API_KEY
+        savedEnv.ATLASCLOUD_BASE_URL = process.env.ATLASCLOUD_BASE_URL
+        delete process.env.ATLASCLOUD_BASE_URL
+
+        const mod = await import("@ai-sdk/openai")
+        createOpenAIMock = mod.createOpenAI as ReturnType<typeof vi.fn>
+        createOpenAIMock.mockClear()
+    })
+
+    afterEach(() => {
+        process.env.ATLASCLOUD_API_KEY = savedEnv.ATLASCLOUD_API_KEY
+        process.env.ATLASCLOUD_BASE_URL = savedEnv.ATLASCLOUD_BASE_URL
+    })
+
+    it("uses Atlas Cloud default endpoint with ATLASCLOUD_API_KEY", () => {
+        process.env.ATLASCLOUD_API_KEY = "server-atlas-key"
+
+        getAIModel({
+            provider: "atlascloud",
+            modelId: "qwen/qwen3.5-flash",
+        })
+
+        expect(createOpenAIMock).toHaveBeenCalledWith({
+            apiKey: "server-atlas-key",
+            baseURL: "https://api.atlascloud.ai/v1",
+        })
+    })
+
+    it("uses custom Atlas Cloud base URL when provided", () => {
+        getAIModel({
+            provider: "atlascloud",
+            apiKey: "client-atlas-key",
+            baseUrl: "https://proxy.example.com/v1",
+            modelId: "deepseek-ai/deepseek-v4-pro",
+        })
+
+        expect(createOpenAIMock).toHaveBeenCalledWith({
+            apiKey: "client-atlas-key",
+            baseURL: "https://proxy.example.com/v1",
+        })
+    })
 })
 
 describe("Kimi provider uses createDeepSeek for reasoning_content support", () => {

@@ -34,7 +34,8 @@
         "glm": "GLM",
         "qwen": "Qwen",
         "kimi": "Kimi",
-        "qiniu": "Qiniu"
+        "qiniu": "Qiniu",
+        "mimo": "MiMo (Xiaomi)"
     },
     "chat": {
         "placeholder": "Describe your diagram or upload a file...",
@@ -131,6 +132,8 @@
         "customSystemMessage": "Custom System Message",
         "customSystemMessageDescription": "Add custom instructions appended to the AI's system prompt.",
         "customSystemMessagePlaceholder": "e.g., Always use blue color scheme for diagrams...",
+        "maxOutputTokens": "Max Output Tokens",
+        "maxOutputTokensDescription": "Budget for one reply, shared by thinking and the diagram XML. Raise it if the AI keeps thinking and no diagram appears. Leave empty for the default.",
         "panelVisibility": "Lobby Panels",
         "panelVisibilityDescription": "Choose which panels to show on the chat lobby.",
         "showRecentChats": "Recent Chats",
@@ -371,6 +374,7 @@
         "baseUrlWithExample": "Base URL (optional, e.g. {example})",
         "customEndpoint": "Custom endpoint URL",
         "minimaxBaseUrlHint": "Use /anthropic for Anthropic-compatible API (recommended), or /v1 for OpenAI-compatible API",
+        "mimoBaseUrlHint": "Default works with pay-as-you-go keys (sk-...). Token Plan subscribers (tp-... keys) must set https://token-plan-cn.xiaomimimo.com/v1",
         "models": "Models",
         "customModelId": "Custom model ID...",
         "allAdded": "All added",
@@ -402,6 +406,152 @@
         "showUnvalidatedModels": "Show unvalidated models",
         "allModelsShown": "All models are shown (including unvalidated)",
         "unvalidatedModelWarning": "This model has not been validated",
-        "serverDefaultModel": "Server default model"
+        "serverDefaultModel": "Server default model",
+        "showValue": "Show value",
+        "hideValue": "Hide value"
+    },
+    "admin": {
+        "title": "Admin Settings",
+        "loginPrompt": "Enter the admin password (the ADMIN_PASSWORD environment variable) to manage server settings.",
+        "password": "Password",
+        "signIn": "Sign In",
+        "signingIn": "Signing In…",
+        "loginFailed": "Login failed",
+        "precedence": "File overrides env · env overrides defaults",
+        "notWritable": "The settings file is not writable on this deployment (serverless platforms have no persistent disk). Settings are shown read-only — configure via environment variables instead.",
+        "settingGroups": "Setting groups",
+        "enabled": "Enabled",
+        "disabled": "Disabled",
+        "enableGroup": "Enable {group}",
+        "unsavedChanges": "Unsaved changes",
+        "saved": "Settings saved. Changes apply immediately.",
+        "saveFailed": "Save failed. Check your connection and try again.",
+        "invalidSettings": "Some settings are invalid.",
+        "discard": "Discard",
+        "saveChanges": "Save Changes",
+        "saving": "Saving…",
+        "sourceSaved": "Saved",
+        "sourceEnv": "Env",
+        "sourceSavedTitle": "Set in the admin settings file",
+        "sourceEnvTitle": "Set by an environment variable",
+        "restartRequired": "Restart Required",
+        "modified": "Modified",
+        "notSet": "Not set",
+        "savedReplace": "Saved ({hint}) — type to replace",
+        "showValue": "Show value",
+        "hideValue": "Hide value",
+        "removeValue": "Remove value",
+        "removeValueTitle": "Remove the stored value",
+        "resetToDefault": "Reset to default",
+        "models": "Models",
+        "modelsDescription": "Server-side providers and models available to all users — no personal API key needed. The default provider's first model is used when users don't pick one.",
+        "addProviderHint": "Add a provider to offer server-side models to all users.",
+        "selectProviderHint": "Select or add a provider to configure its credentials and models.",
+        "addProviderToOfferModels": "Add at least one model to expose this provider to users.",
+        "managedViaEnv": "(managed via env)",
+        "envReadOnly": "Defined in AI_MODELS_CONFIG / ai-models.json — read-only here. Edit the environment configuration to change it.",
+        "defaultModel": "Default Model",
+        "noModelsConfigured": "No models configured",
+        "modelCount": "{count} model",
+        "modelCountPlural": "{count} models",
+        "default": "Default",
+        "setAsDefault": "Set as default provider",
+        "defaultProvider": "Default provider",
+        "modelIdPlaceholder": "Model ID…",
+        "addModel": "Add model",
+        "suggested": "Suggested",
+        "test": "Test",
+        "testOk": "OK ({ms}ms)",
+        "testFailed": "Failed",
+        "removeModel": "Remove {model}",
+        "deleteProviderTitle": "Delete {name}?",
+        "deleteProviderDesc": "Its credentials and models will be removed from the server after you save.",
+        "cancel": "Cancel",
+        "delete": "Delete",
+        "groups": {
+            "generation": {
+                "title": "Generation",
+                "description": "Output parameters applied to all chat requests."
+            },
+            "access": {
+                "title": "Access Control",
+                "description": "Restrict who can use this deployment."
+            },
+            "features": {
+                "title": "Features",
+                "description": "Optional features and security toggles."
+            },
+            "observability": {
+                "title": "Observability",
+                "description": "Langfuse tracing for LLM calls."
+            },
+            "quota": {
+                "title": "Quota & Rate Limits",
+                "description": "Per-IP usage limits. Enforcement requires a DynamoDB table."
+            }
+        },
+        "settings": {
+            "TEMPERATURE": {
+                "label": "Temperature",
+                "description": "Leave unset for reasoning models that reject temperature."
+            },
+            "MAX_OUTPUT_TOKENS": {
+                "label": "Max Output Tokens"
+            },
+            "ACCESS_CODE_LIST": {
+                "label": "Access Codes",
+                "description": "Comma-separated list. Users must enter one to chat. Empty = open access."
+            },
+            "ENABLE_VLM_VALIDATION": {
+                "label": "VLM Diagram Validation",
+                "description": "Visually validate generated diagrams with a vision model."
+            },
+            "VALIDATION_MODEL": {
+                "label": "Validation Model",
+                "description": "Falls back to the default AI model when empty."
+            },
+            "VALIDATION_TIMEOUT": {
+                "label": "Validation Timeout (ms)"
+            },
+            "ENABLE_HISTORY_XML_REPLACE": {
+                "label": "History XML Compression",
+                "description": "Replace old diagram XML in history with placeholders."
+            },
+            "ALLOW_PRIVATE_URLS": {
+                "label": "Allow Private URLs",
+                "description": "Turn off to block requests to private IPs and internal hostnames (SSRF protection)."
+            },
+            "LANGFUSE_PUBLIC_KEY": {
+                "label": "Langfuse Public Key"
+            },
+            "LANGFUSE_SECRET_KEY": {
+                "label": "Langfuse Secret Key"
+            },
+            "LANGFUSE_BASEURL": {
+                "label": "Langfuse Base URL"
+            },
+            "DAILY_REQUEST_LIMIT": {
+                "label": "Daily Request Limit",
+                "description": "Per IP per day."
+            },
+            "DAILY_TOKEN_LIMIT": {
+                "label": "Daily Token Limit",
+                "description": "Per IP per day."
+            },
+            "TPM_LIMIT": {
+                "label": "Tokens Per Minute"
+            },
+            "DYNAMODB_QUOTA_TABLE": {
+                "label": "DynamoDB Table",
+                "description": "Quota enforcement is disabled when empty."
+            },
+            "DYNAMODB_REGION": {
+                "label": "DynamoDB Region"
+            },
+            "QUOTA_TIMEZONE": {
+                "label": "Quota Timezone",
+                "description": "Timezone for the daily reset boundary."
+            }
+        }
     }
 }

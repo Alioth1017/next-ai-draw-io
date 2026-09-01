@@ -46,6 +46,21 @@ AI_MODEL=gpt-4o
 OPENAI_BASE_URL=https://your-custom-endpoint/v1
 ```
 
+### AIHubMix
+
+AIHubMix は、単一の API キーで Claude、GPT、Gemini、DeepSeek などのモデルへのアクセスを提供します。
+
+```bash
+AIHUBMIX_API_KEY=your_api_key
+AI_MODEL=claude-sonnet-4-5-20250929
+```
+
+任意のカスタムエンドポイント:
+
+```bash
+AIHUBMIX_BASE_URL=https://aihubmix.com/v1
+```
+
 ### Anthropic
 
 ```bash
@@ -293,6 +308,19 @@ AI_MODEL=your_model_id
 QINIU_BASE_URL=https://your-custom-endpoint
 ```
 
+### MiMo (Xiaomi)
+
+```bash
+MIMO_API_KEY=your_api_key
+AI_MODEL=mimo-v2.5-pro
+```
+
+オプションのカスタムエンドポイント（Token Plan 加入者は専用の Base URL を設定してください）：
+
+```bash
+MIMO_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
+```
+
 ## 自動検出
 
 **1つ**のプロバイダーの API キーのみを設定した場合、システムはそのプロバイダーを自動的に検出して使用します。`AI_PROVIDER` を設定する必要はありません。
@@ -300,7 +328,7 @@ QINIU_BASE_URL=https://your-custom-endpoint
 **複数**の API キーを設定する場合は、`AI_PROVIDER` を明示的に設定する必要があります:
 
 ```bash
-AI_PROVIDER=google  # または: openai, anthropic, deepseek, siliconflow, doubao, azure, bedrock, openrouter, ollama, gateway, sglang, modelscope, minimax, glm, qwen, kimi, qiniu
+AI_PROVIDER=google  # または: openai, anthropic, aihubmix, deepseek, siliconflow, doubao, azure, bedrock, openrouter, ollama, gateway, sglang, modelscope, minimax, glm, qwen, kimi, qiniu, mimo
 ```
 
 ## サーバーサイドマルチモデル設定
@@ -320,6 +348,17 @@ AI_MODELS_CONFIG='{"providers":[{"name":"OpenAI","provider":"openai","models":["
 **方法2：設定ファイル**
 
 プロジェクトルートに `ai-models.json` ファイルを作成します（または `AI_MODELS_CONFIG_PATH` でパスを指定）。
+
+**方法3：`AI_MODEL` をカンマ区切りで指定**（単一プロバイダーの簡易設定）
+
+同一プロバイダー内の複数モデルだけを公開したい場合は、`AI_MODEL` にカンマ区切りで列挙できます。最初のモデルがデフォルトになります。
+
+```bash
+AI_PROVIDER=doubao
+AI_MODEL=doubao-seed-1-8-251215,doubao-seed-1-6-flash,doubao-seed-1-6-pro
+```
+
+これは等価な `ai-models.json` の簡易表記です。複数のプロバイダーや、カスタム `apiKeyEnv` / `baseUrlEnv` を使う場合は、方法1または方法2を使ってください。
 
 ### 設定例
 

@@ -203,6 +203,7 @@ Next.jsアプリをデプロイする最も簡単な方法は、Next.jsの作成
 -   Azure OpenAI
 -   Ollama
 -   OpenRouter
+-   AIHubMix
 -   DeepSeek
 -   SiliconFlow
 -   ModelScope
@@ -215,11 +216,17 @@ AWS BedrockとOpenRouter以外のすべてのプロバイダーはカスタム�
 
 ### サーバーサイドマルチモデル設定
 
-管理者は、ユーザーが個人のAPIキーを提供することなく利用できる複数のサーバーサイドモデルを設定できます。`AI_MODELS_CONFIG` 環境変数（JSON文字列）または `ai-models.json` ファイルで設定します。
+管理者は、ユーザーが個人のAPIキーを提供することなく利用できる複数のサーバーサイドモデルを設定できます。`AI_MODELS_CONFIG` 環境変数（JSON文字列）または `ai-models.json` ファイルで設定します。同一プロバイダー内の複数モデルだけが必要な場合は、`AI_MODEL` にカンマ区切りでモデルIDを列挙する簡易設定も使えます。
 
 **モデル要件**：このタスクは厳密なフォーマット制約（draw.io XML）を持つ長文テキスト生成を伴うため、強力なモデル機能が必要です。Claude Sonnet 4.5、GPT-5.1、Gemini 3 Pro、DeepSeek V3.2/R1を推奨します。
 
 注：`claude`シリーズはAWS、Azure、GCPなどのクラウドアーキテクチャロゴ付きのdraw.ioダイアグラムで学習されているため、クラウドアーキテクチャダイアグラムを作成したい場合は最適な選択です。
+
+### 管理パネル
+
+`ADMIN_PASSWORD` 環境変数を設定して `/admin` にアクセスすると、`.env` を手動で編集する代わりに Web パネルでサーバー設定（モデル、アクセスコード、機能、可観測性、クォータ）を管理できます。
+
+📖 **[管理パネルガイド](./admin-panel.md)** — 有効化の方法、優先順位ルール、注意事項。
 
 
 ## 仕組み

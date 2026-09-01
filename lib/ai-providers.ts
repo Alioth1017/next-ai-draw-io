@@ -6,12 +6,15 @@ import { createGateway, gateway } from "@ai-sdk/gateway"
 import { createGoogleGenerativeAI, google } from "@ai-sdk/google"
 import { createVertex } from "@ai-sdk/google-vertex"
 import { createOpenAI, openai } from "@ai-sdk/openai"
+import { aihubmix, createAihubmix } from "@aihubmix/ai-sdk-provider"
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers"
 import { createOpenRouter } from "@openrouter/ai-sdk-provider"
 import { createOllama, ollama } from "ollama-ai-provider-v2"
 import { PROVIDER_INFO, type ProviderName } from "@/lib/types/model-config"
 
 export type { ProviderName }
+
+export const AIHUBMIX_APP_CODE = "MSBS9675"
 
 interface ModelConfig {
     model: any
@@ -29,6 +32,7 @@ export const SINGLE_SYSTEM_PROVIDERS = new Set<ProviderName>([
     "kimi",
     "qiniu",
     "novita",
+    "mimo",
 ])
 
 /**
@@ -55,6 +59,18 @@ export function normalizeMiniMaxBaseURL(rawUrl: string): {
         }
     }
     return { baseURL, isAnthropicCompatible }
+}
+
+export function isAihubmixStandardBaseURL(
+    rawUrl: string | null | undefined,
+): boolean {
+    if (!rawUrl) return true
+
+    const baseURL = rawUrl.replace(/\/+$/, "")
+    return (
+        baseURL === "https://aihubmix.com" ||
+        baseURL === "https://aihubmix.com/v1"
+    )
 }
 
 export interface ClientOverrides {
@@ -86,6 +102,7 @@ const ALLOWED_CLIENT_PROVIDERS: ProviderName[] = [
     "azure",
     "bedrock",
     "openrouter",
+    "aihubmix",
     "deepseek",
     "siliconflow",
     "sglang",
@@ -100,6 +117,8 @@ const ALLOWED_CLIENT_PROVIDERS: ProviderName[] = [
     "kimi",
     "minimax",
     "novita",
+    "mimo",
+    "atlascloud",
 ]
 
 // Bedrock provider options for Anthropic beta features
@@ -513,6 +532,7 @@ function buildProviderOptions(
 
         case "deepseek":
         case "openrouter":
+        case "aihubmix":
         case "siliconflow":
         case "sglang":
         case "gateway":
@@ -523,7 +543,9 @@ function buildProviderOptions(
         case "qwen":
         case "kimi":
         case "qiniu":
-        case "novita": {
+        case "novita":
+        case "atlascloud":
+        case "mimo": {
             // These providers don't have reasoning configs in AI SDK yet
             // Gateway passes through to underlying providers which handle their own configs
             break
@@ -537,7 +559,7 @@ function buildProviderOptions(
 }
 
 // Map of provider to required environment variable
-const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
+export const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
     bedrock: null, // AWS SDK auto-uses IAM role on AWS, or env vars locally
     openai: "OPENAI_API_KEY",
     anthropic: "ANTHROPIC_API_KEY",
@@ -546,6 +568,7 @@ const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
     azure: "AZURE_API_KEY",
     ollama: null, // No credentials needed for local Ollama
     openrouter: "OPENROUTER_API_KEY",
+    aihubmix: "AIHUBMIX_API_KEY",
     deepseek: "DEEPSEEK_API_KEY",
     siliconflow: "SILICONFLOW_API_KEY",
     sglang: "SGLANG_API_KEY",
@@ -559,6 +582,8 @@ const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
     kimi: "KIMI_API_KEY",
     minimax: "MINIMAX_API_KEY",
     novita: "NOVITA_API_KEY",
+    mimo: "MIMO_API_KEY",
+    atlascloud: "ATLASCLOUD_API_KEY",
 }
 
 /**
@@ -662,7 +687,7 @@ function validateProviderCredentials(
  * Get the AI model based on environment variables
  *
  * Environment variables:
- * - AI_PROVIDER: The provider to use (bedrock, openai, anthropic, google, azure, ollama, openrouter, deepseek, siliconflow, sglang, gateway, modelscope)
+ * - AI_PROVIDER: The provider to use (bedrock, openai, anthropic, google, azure, ollama, openrouter, aihubmix, deepseek, siliconflow, sglang, gateway, modelscope)
  * - AI_MODEL: The model ID/name for the selected provider
  *
  * Provider-specific env vars:
@@ -674,6 +699,7 @@ function validateProviderCredentials(
  * - AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY: AWS Bedrock credentials
  * - OLLAMA_BASE_URL: Ollama server URL (optional, defaults to https://ollama.com/api)
  * - OPENROUTER_API_KEY: OpenRouter API key
+ * - AIHUBMIX_API_KEY: AIHubMix API key
  * - DEEPSEEK_API_KEY: DeepSeek API key
  * - DEEPSEEK_BASE_URL: DeepSeek endpoint (optional)
  * - SILICONFLOW_API_KEY: SiliconFlow API key
@@ -710,8 +736,10 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
             (overrides?.provider === "vertexai" && overrides?.vertexApiKey))
     )
 
-    // Use client override if provided, otherwise fall back to env vars
-    const modelId = overrides?.modelId || process.env.AI_MODEL
+    // Use client override if provided, otherwise fall back to env vars.
+    // AI_MODEL may be comma-separated (multi-model fallback); pick the first.
+    const envModel = process.env.AI_MODEL?.split(",")[0]?.trim() || undefined
+    const modelId = overrides?.modelId || envModel
 
     if (!modelId) {
         if (isClientOverride) {
@@ -761,6 +789,7 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
                         `- GOOGLE_GENERATIVE_AI_API_KEY for Google\n` +
                         `- AWS_ACCESS_KEY_ID for Bedrock\n` +
                         `- OPENROUTER_API_KEY for OpenRouter\n` +
+                        `- AIHUBMIX_API_KEY for AIHubMix\n` +
                         `- AZURE_API_KEY for Azure\n` +
                         `- SILICONFLOW_API_KEY for SiliconFlow\n` +
                         `- SGLANG_API_KEY for SGLang\n` +
@@ -1000,6 +1029,42 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
                 ...(baseURL && { baseURL }),
             })
             model = openrouter(modelId)
+            break
+        }
+
+        case "aihubmix": {
+            const apiKey = resolveApiKey(overrides, "AIHUBMIX_API_KEY")
+            const serverBaseUrl = resolveBaseUrlEnv(
+                overrides,
+                "AIHUBMIX_BASE_URL",
+            )
+            const baseURL = resolveBaseURL(
+                overrides?.apiKey,
+                overrides?.baseUrl,
+                serverBaseUrl,
+                PROVIDER_INFO.aihubmix.defaultBaseUrl,
+            )
+            const defaultBaseURL = PROVIDER_INFO.aihubmix.defaultBaseUrl
+
+            if (
+                isAihubmixStandardBaseURL(baseURL) ||
+                baseURL === defaultBaseURL
+            ) {
+                const aihubmixProvider =
+                    overrides?.apiKey || apiKey
+                        ? createAihubmix({
+                              apiKey,
+                              appCode: AIHUBMIX_APP_CODE,
+                          })
+                        : aihubmix
+                model = aihubmixProvider(modelId)
+            } else {
+                const aihubmixCompatibleProvider = createOpenAI({
+                    apiKey,
+                    baseURL,
+                })
+                model = aihubmixCompatibleProvider.chat(modelId)
+            }
             break
         }
 
@@ -1288,10 +1353,28 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
             break
         }
 
+        case "mimo": {
+            const apiKey = resolveApiKey(overrides, "MIMO_API_KEY")
+            const baseURL = resolveBaseURL(
+                overrides?.apiKey,
+                overrides?.baseUrl,
+                resolveBaseUrlEnv(overrides, "MIMO_BASE_URL"),
+                PROVIDER_INFO.mimo?.defaultBaseUrl,
+            )
+            // Use createDeepSeek to properly handle reasoning_content for MiMo
+            // thinking models (e.g., mimo-v2.5-pro). MiMo's API requires
+            // reasoning_content to be passed back during multi-turn tool calls
+            // (returns 400 otherwise), same convention as DeepSeek and Kimi.
+            const mimoProvider = createDeepSeek({ apiKey, baseURL })
+            model = mimoProvider(modelId)
+            break
+        }
+
         case "glm":
         case "qwen":
         case "qiniu":
-        case "novita": {
+        case "novita":
+        case "atlascloud": {
             const envVar = PROVIDER_ENV_VARS[provider]
             if (!envVar) {
                 throw new Error(
@@ -1322,7 +1405,7 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
                 overrides?.apiKey,
                 overrides?.baseUrl,
                 resolveBaseUrlEnv(overrides, "KIMI_BASE_URL"),
-                PROVIDER_INFO["kimi"]?.defaultBaseUrl,
+                PROVIDER_INFO.kimi?.defaultBaseUrl,
             )
             // Use createDeepSeek to properly handle reasoning_content for Kimi
             // thinking models (e.g., kimi-k2.6). Kimi's API uses the same
@@ -1335,7 +1418,7 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
 
         default:
             throw new Error(
-                `Unknown AI provider: ${provider}. Supported providers: bedrock, openai, anthropic, google, azure, ollama, openrouter, deepseek, siliconflow, sglang, gateway, edgeone, doubao, modelscope, glm, qwen, qiniu, kimi, minimax, novita`,
+                `Unknown AI provider: ${provider}. Supported providers: bedrock, openai, anthropic, google, azure, ollama, openrouter, aihubmix, deepseek, siliconflow, sglang, gateway, edgeone, doubao, modelscope, glm, qwen, qiniu, kimi, minimax, novita, mimo, atlascloud`,
             )
     }
 
@@ -1362,89 +1445,22 @@ export function supportsPromptCaching(modelId: string): boolean {
 }
 
 /**
- * Check if a model supports image/vision input.
- * Some models silently drop image parts without error (AI SDK warning only).
- */
-export function supportsImageInput(modelId: string): boolean {
-    const lowerModelId = modelId.toLowerCase()
-
-    // Helper to check if model has vision capability indicator
-    const hasVisionIndicator =
-        lowerModelId.includes("vision") || lowerModelId.includes("vl")
-
-    // Models that DON'T support image/vision input (unless vision variant)
-    // Kimi K2 doesn't support images, but K2.5 does
-    // Only block kimi-k2 specifically, not other Kimi models
-    if (
-        (lowerModelId.includes("kimi-k2") ||
-            lowerModelId.includes("kimi_k2")) &&
-        !hasVisionIndicator &&
-        !lowerModelId.includes("2.5") &&
-        !lowerModelId.includes("k2.5")
-    ) {
-        return false
-    }
-
-    // Moonshot text models (moonshot-v1 series are text-only)
-    if (lowerModelId.includes("moonshot-v1") && !hasVisionIndicator) {
-        return false
-    }
-
-    // MiniMax text models (MiniMax-M2.x series are text-only; M3 supports image input)
-    if (
-        lowerModelId.includes("minimax") &&
-        !hasVisionIndicator &&
-        !lowerModelId.includes("m3")
-    ) {
-        return false
-    }
-
-    // DeepSeek text models (not vision variants)
-    if (lowerModelId.includes("deepseek") && !hasVisionIndicator) {
-        return false
-    }
-
-    // Qwen text models (not vision variants like qwen-vl)
-    // Qwen3.5 series (qwen3.5, qwen3.5-plus, qwen3.5-flash) natively support image input
-    // QvQ (Qwen Visual QA) models are vision models — exclude them even when prefixed with "qwen/"
-    if (
-        lowerModelId.includes("qwen") &&
-        !hasVisionIndicator &&
-        !lowerModelId.includes("qwen3.5") &&
-        !lowerModelId.includes("qvq")
-    ) {
-        return false
-    }
-
-    // GLM text models (not vision variants)
-    // GLM vision models: glm-4v, glm-4v-9b, glm-4.1v-9b-thinking
-    if (lowerModelId.includes("glm") && !hasVisionIndicator) {
-        if (!/[\d.]v/.test(lowerModelId)) {
-            return false
-        }
-    }
-
-    // Default: assume model supports images
-    return true
-}
-
-/**
  * Get the AI model for diagram validation.
  * Uses VALIDATION_MODEL env var if set, otherwise falls back to AI_MODEL.
- * Throws if the model doesn't support image input.
+ *
+ * Note: we no longer guess whether the model supports image input from its
+ * name — that heuristic misfired on newer models (see issue #874). If a
+ * configured validation model can't handle images, the API call simply errors
+ * and the validate-diagram route falls back to "valid".
  */
 export function getValidationModel(): ReturnType<typeof getAIModel>["model"] {
-    const modelId = process.env.VALIDATION_MODEL || process.env.AI_MODEL
+    // AI_MODEL may be comma-separated (multi-model fallback); pick the first.
+    const envFallback = process.env.AI_MODEL?.split(",")[0]?.trim() || undefined
+    const modelId = process.env.VALIDATION_MODEL || envFallback
 
     if (!modelId) {
         throw new Error(
             "No validation model configured. Set VALIDATION_MODEL or AI_MODEL.",
-        )
-    }
-
-    if (!supportsImageInput(modelId)) {
-        throw new Error(
-            `Validation requires a vision-capable model. Model "${modelId}" does not support image input.`,
         )
     }
 
